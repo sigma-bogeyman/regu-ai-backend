@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import Parser from "rss-parser";
 
 const app = express();
@@ -8,8 +9,17 @@ const parser = new Parser({
   headers: { "User-Agent": "RegVerse/1.0 (regulatory-intelligence-app)" },
 });
 
-app.use(cors());
+// Lock CORS to Capacitor app origins only
+app.use(cors({
+  origin: ["capacitor://localhost", "https://localhost", "http://localhost"],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type"],
+}));
 app.use(express.json());
+
+// Rate limiters — 30 req/min for news, 20 req/min for analyze
+const newsLimiter = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
+const analyzeLimiter = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false });
 
 
 // ── HOME ROUTE ────────────────────────────────────────────
@@ -239,7 +249,7 @@ async function buildNewsFeed() {
 
 
 // ── NEWS ROUTE ────────────────────────────────────────────
-app.get("/news", async (req, res) => {
+app.get("/news", newsLimiter, async (req, res) => {
   const now = Date.now();
 
   // Always respond immediately with whatever is cached (static or live)
@@ -376,44 +386,60 @@ function makeRecommendation(changeType, severity, productType, regions) {
   return `This is a low-risk change. File or notify as required by each market (${regionList}). Retain supporting documentation in your change control system. No prior approval is expected, but ensure all records are inspection-ready.`;
 }
 
-app.post("/analyze", (req, res) => {
-  const { input } = req.body;
+app.post("/analyze", analyzeLimiter, (req, res) => {
+  try {
+    const { input } = req.body;
 
-  const { productType, appliesTo, changeType, regions = [], riskFlags = {} } = input;
-  const flags = {
-    cqa:        !!riskFlags.cqa,
-    impurity:   !!riskFlags.impurity,
-    sterility:  !!riskFlags.sterility,
-    validation: !!riskFlags.validation,
-  };
-
-  const severity = calcSeverity(changeType, flags);
-  const ctdSections = getCTDSections(changeType, appliesTo);
-
-  const regionResults = {};
-  for (const region of regions) {
-    const entry = REGIONAL_MATRIX[region]?.[severity];
-    if (entry) {
-      regionResults[region] = { ...entry, risk: severity };
+    // Input validation
+    if (!input || typeof input !== "object") {
+      return res.status(400).json({ error: "Invalid request: input object is required" });
     }
+    const { productType, appliesTo, changeType, regions, riskFlags } = input;
+    if (!changeType || typeof changeType !== "string") {
+      return res.status(400).json({ error: "Invalid request: changeType is required" });
+    }
+
+    const safeRegions  = Array.isArray(regions)  ? regions  : [];
+    const safeFlags    = riskFlags && typeof riskFlags === "object" ? riskFlags : {};
+
+    const flags = {
+      cqa:        !!safeFlags.cqa,
+      impurity:   !!safeFlags.impurity,
+      sterility:  !!safeFlags.sterility,
+      validation: !!safeFlags.validation,
+    };
+
+    const severity = calcSeverity(changeType, flags);
+    const ctdSections = getCTDSections(changeType, appliesTo);
+
+    const regionResults = {};
+    for (const region of safeRegions) {
+      const entry = REGIONAL_MATRIX[region]?.[severity];
+      if (entry) {
+        regionResults[region] = { ...entry, risk: severity };
+      }
+    }
+
+    const riskNotes = [];
+    if (flags.cqa)        riskNotes.push("CQA impact identified — comparability data required");
+    if (flags.impurity)   riskNotes.push("Impurity profile change — ICH Q3A/Q3B justification needed");
+    if (flags.sterility)  riskNotes.push("Sterility assurance impact — sterility validation data required");
+    if (flags.validation) riskNotes.push("Process validation required — at least 3 conformance batches expected");
+
+    res.json({
+      severity,
+      productType,
+      changeType,
+      appliesTo,
+      regions: regionResults,
+      ctdSections,
+      riskNotes,
+      recommendation: makeRecommendation(changeType, severity, productType || "", safeRegions),
+    });
+  } catch (e) {
+    console.error("[/analyze] error:", e);
+    res.status(500).json({ error: "Internal server error" });
   }
-
-  const riskNotes = [];
-  if (flags.cqa)        riskNotes.push("CQA impact identified — comparability data required");
-  if (flags.impurity)   riskNotes.push("Impurity profile change — ICH Q3A/Q3B justification needed");
-  if (flags.sterility)  riskNotes.push("Sterility assurance impact — sterility validation data required");
-  if (flags.validation) riskNotes.push("Process validation required — at least 3 conformance batches expected");
-
-  res.json({
-    severity,
-    productType,
-    changeType,
-    appliesTo,
-    regions: regionResults,
-    ctdSections,
-    riskNotes,
-    recommendation: makeRecommendation(changeType, severity, productType, regions),
-  });
 });
 
 
