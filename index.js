@@ -600,57 +600,72 @@ app.post("/analyze", analyzeLimiter, (req, res) => {
 // ── AI ANALYSIS — async job queue ────────────────────────────────────────────
 const aiLimiter = rateLimit({ windowMs: 60_000, max: 10, standardHeaders: true, legacyHeaders: false });
 
-function buildPharmaPrompt(assessResult) {
-  return `You are a senior regulatory affairs expert specialising in pharmaceutical post-approval change management (ICH Q10, EU Variations Regulation 1234/2008, FDA CMC guidance).
+// Shared scoping rules + JSON schema used by both prompts.
+// `regions` is the exact list of markets the user selected — the model must never
+// stray outside it (this is what stops EMA/EU appearing when it wasn't selected).
+function insightContract(regions, domain) {
+  const regionList = (regions || []).length ? regions.join(", ") : "(none specified)";
+  const emaNote = domain === "device"
+    ? "\n- IMPORTANT: The EMA does NOT regulate medical devices. Never mention EMA, EMA variations, or centralised procedure for a device change."
+    : "";
+  return `CRITICAL MARKET-SCOPING RULES (follow exactly):
+- The user selected ONLY these markets: ${regionList}.
+- Every guidance, risk, document, and strategy you give MUST be limited to these markets.
+- Do NOT mention, cite, compare to, or reference ANY market, agency, or regulatory framework that is not in that list. In particular do NOT mention EMA or EU variation categories (Type IA/IB/II) unless an EU or EMA market is explicitly in the list above.
+- "marketSpecific" MUST contain exactly one entry for each selected market and no others.${emaNote}
 
-A regulatory assessment has been run. Provide expert insight as valid JSON only — no markdown, no prose outside the JSON.
+Respond with valid JSON only — no markdown, no prose outside the JSON — using this exact structure:
+{
+  "applicableGuidances": [
+    { "code": "e.g. ICH Q12 / MDCG 2020-3 / ISO 14971 / 21 CFR 807.81", "section": "specific clause/section number if known, else \\"\\"", "title": "short title of the guideline", "relevance": "1-2 sentences on why THIS specific change triggers this guideline", "keyQuote": "the specific phrasing or snippet from that exact clause that applies to THIS change — reproduce the guideline's actual wording as precisely as possible; if you are not certain of the verbatim text, give the closest faithful paraphrase and never invent clause numbers or wording, else \\"\\"" }
+  ],
+  "keyPoints": [ "3 to 5 specific, change-specific, actionable insights citing the exact guideline or clause" ],
+  "potentialRisks": [ "concrete regulatory or technical risks specific to this change; return [] if genuinely none" ],
+  "submissionStrategy": "one paragraph on filing sequence and strategy ACROSS THE SELECTED MARKETS ONLY — leveraging prior approvals, clock-stop/objection risk, parallel vs sequential filing",
+  "marketSpecific": [ { "market": "one of the selected markets", "documents": "the specific dossier sections / documents to prepare for that market", "note": "the filing type and timeline nuance for that market" } ],
+  "strategicInsight": "one paragraph of higher-level strategic advice",
+  "commonPitfalls": [ "reviewer focus areas or common mistakes for this change type" ],
+  "preSubmissionRecommendations": [ "checklist items to complete before filing" ]
+}
+Provide 2 to 4 applicableGuidances. Be specific and technical — cite real guideline codes and clause numbers, not generic statements.`;
+}
+
+function buildPharmaPrompt(assessResult) {
+  const regions = assessResult.selectedRegions || [];
+  const euSelected = regions.some(r => /EU|EMA|EEA/i.test(r));
+  return `You are a senior regulatory affairs expert in pharmaceutical post-approval change management (ICH Q8-Q12, CTD/eCTD, and the specific post-approval change frameworks of the selected markets only).
+
+A regulatory assessment has been run.
 
 Assessment context:
 - Product type: ${assessResult.productType || "Pharmaceutical"}
 - Change: ${assessResult.title || assessResult.code || "Unknown change"}
 - Sub-section: ${assessResult.subSectionLabel || ""}
-- Condition: ${assessResult.subTypeDesc || ""}
-- EU variation type: ${assessResult.euType || ""}
+- Condition: ${assessResult.subTypeDesc || ""}${euSelected ? `\n- EU variation type: ${assessResult.euType || ""}` : ""}
 - Severity: ${assessResult.severity || ""}
-- Territories: ${(assessResult.selectedRegions || []).join(", ")}
+- Selected markets: ${regions.join(", ")}
 
-Respond with this exact JSON structure:
-{
-  "keyPoints": [
-    "3 to 5 specific, actionable regulatory insights for this change — cite ICH guidelines, CTD modules, or agency-specific requirements",
-    "Include data package expectations, timing requirements, or known agency stances on this change type",
-    "Mention any common pitfalls or reviewer focus areas for this variation type"
-  ],
-  "strategicInsight": "One paragraph of strategic advice — e.g. sequencing submissions, leveraging prior approvals, clock-stop risk, or parallel submission strategy"
-}`;
+${insightContract(regions, "pharma")}`;
 }
 
 function buildMDPrompt(assessResult) {
+  const regions = assessResult.selectedRegions || [];
   const filingsSummary = (assessResult.filings || [])
     .map(f => `${f.territory} (${f.agency}): ${f.action?.label} — ${f.action?.timeline}`)
     .join("\n");
 
-  return `You are a senior regulatory affairs consultant specialising in medical device regulation (EU MDR 2017/745, MDCG 2020-3, FDA 21 CFR Part 820, ISO 13485, ISO 14971).
+  return `You are a senior medical device regulatory consultant (ISO 13485, ISO 14971, IEC 62304, MDCG guidance, FDA 21 CFR Part 820 and 807, and the device frameworks of the selected markets only).
 
-A device change assessment has been completed. Provide expert insight as valid JSON only — no markdown, no prose outside the JSON.
+A device change assessment has been completed.
 
 Assessment context:
 - Device class: ${assessResult.mdDeviceClass || ""}
 - Change type: ${assessResult.changeLabel || assessResult.mdChangeType || ""}
-- Territories assessed: ${(assessResult.selectedRegions || []).join(", ")}
+- Selected markets: ${regions.join(", ")}
 - Filing requirements:
 ${filingsSummary}
 
-Respond with this exact JSON structure:
-{
-  "keyPoints": [
-    "3 to 5 specific, actionable insights — cite MDCG guidance documents, ISO standards, or FDA guidance as appropriate",
-    "Address whether this change is likely to cross the 'significant change' threshold under MDCG 2020-3 or FDA significant-change guidance",
-    "Include Notified Body expectations, Technical Documentation requirements, or clinical evaluation update needs",
-    "Mention any risk management (ISO 14971) or V&V considerations specific to this change type"
-  ],
-  "strategicInsight": "One paragraph of strategic advice — e.g. engaging Notified Body early, PMCF implications, parallel filing strategy, or how to frame the change to minimise regulatory burden"
-}`;
+${insightContract(regions, "device")}`;
 }
 
 app.post("/analyze/start", aiLimiter, async (req, res) => {
