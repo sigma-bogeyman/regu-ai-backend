@@ -96,6 +96,50 @@ function escapeHtml(s) {
   return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+// ── GOOGLE PLAY BILLING verification (server-side) ─────────
+const ANDROID_PACKAGE     = process.env.ANDROID_PACKAGE_NAME || "com.regverse.app";
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
+// Railway stores the PEM with literal \n — turn them back into real newlines.
+const GOOGLE_PRIVATE_KEY  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+
+let _gTok = { token: null, exp: 0 };
+// Exchange the service-account key for a short-lived Google API access token.
+async function getGoogleAccessToken() {
+  if (_gTok.token && Date.now() < _gTok.exp - 60_000) return _gTok.token;
+  if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) throw new Error("Google service account not configured");
+  const assertion = jwt.sign(
+    { scope: "https://www.googleapis.com/auth/androidpublisher" },
+    GOOGLE_PRIVATE_KEY,
+    { algorithm: "RS256", issuer: GOOGLE_CLIENT_EMAIL, audience: "https://oauth2.googleapis.com/token", expiresIn: 3600 }
+  );
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion }),
+  });
+  const data = await r.json();
+  if (!data.access_token) throw new Error("Google token error: " + JSON.stringify(data));
+  _gTok = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
+  return data.access_token;
+}
+
+// GET a subscription purchase's status from the Play Developer API.
+async function getSubscription(productId, token) {
+  const access = await getGoogleAccessToken();
+  const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${ANDROID_PACKAGE}/purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${access}` } });
+  const data = await r.json();
+  if (!r.ok) throw new Error("subscription verify failed: " + JSON.stringify(data));
+  return data; // { paymentState, expiryTimeMillis, acknowledgementState, ... }
+}
+
+// Acknowledge a purchase (required within 3 days or Google auto-refunds).
+async function acknowledgeSubscription(productId, token) {
+  const access = await getGoogleAccessToken();
+  const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${ANDROID_PACKAGE}/purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}:acknowledge`;
+  await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: "{}" });
+}
+
 // requireAuth — validates the Bearer token and loads req.user
 async function requireAuth(req, res, next) {
   try {
@@ -301,6 +345,47 @@ app.post("/auth/reset-password", async (req, res) => {
   } catch (e) {
     console.error("[/auth/reset-password]", e);
     return res.status(500).json({ error: "Could not reset password. Please try again." });
+  }
+});
+
+// ── UPGRADE TO PREMIUM (verify Google Play purchase) ───────
+// The app sends the Google purchaseToken here after a successful buy/restore.
+// We verify it server-side, acknowledge it, mark the user premium, and return
+// a fresh JWT so the app flips to premium immediately.
+app.post("/auth/upgrade-premium", requireAuth, async (req, res) => {
+  try {
+    const { purchaseToken, productId } = req.body || {};
+    if (!purchaseToken || !productId) return res.status(400).json({ error: "Missing purchase details" });
+
+    let sub;
+    try {
+      sub = await getSubscription(productId, purchaseToken);
+    } catch (e) {
+      console.error("[upgrade-premium] verify:", e);
+      return res.status(400).json({ error: "Could not verify this purchase with Google Play. Please try again." });
+    }
+
+    // paymentState: 0 pending, 1 received, 2 free trial, 3 deferred
+    const paid = sub.paymentState === 1 || sub.paymentState === 2;
+    const notExpired = Number(sub.expiryTimeMillis || 0) > Date.now();
+    if (!paid || !notExpired) return res.status(400).json({ error: "This subscription is not active." });
+
+    // Acknowledge if Google hasn't seen an ack yet (required within 3 days).
+    if (sub.acknowledgementState === 0) {
+      try { await acknowledgeSubscription(productId, purchaseToken); }
+      catch (e) { console.error("[upgrade-premium] acknowledge:", e); }
+    }
+
+    const db = await getDb();
+    await db.collection("users").updateOne(
+      { _id: req.user._id },
+      { $set: { plan: "premium", subscription: { productId, purchaseToken, expiryTimeMillis: sub.expiryTimeMillis, updatedAt: new Date() } } }
+    );
+    const fresh = await db.collection("users").findOne({ _id: req.user._id });
+    return res.json({ token: signToken(fresh._id.toString()), user: publicUser(fresh) });
+  } catch (e) {
+    console.error("[/auth/upgrade-premium]", e);
+    return res.status(500).json({ error: "Could not complete the upgrade. Please try again." });
   }
 });
 
