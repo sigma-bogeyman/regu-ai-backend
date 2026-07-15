@@ -702,6 +702,7 @@ app.get("/analyze/status/:jobId", (req, res) => {
 });
 
 
-app.listen(5001, "0.0.0.0", () => {
-  console.log("RegRadar backend running on port 5001");
+const PORT = process.env.PORT || 5001;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("RegVerse backend running on port " + PORT);
 });
