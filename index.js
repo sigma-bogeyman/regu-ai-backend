@@ -4,8 +4,8 @@ import rateLimit from "express-rate-limit";
 import Parser from "rss-parser";
 import OpenAI from "openai";
 
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const openai = (process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse)
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse })
   : null;
 
 // In-memory job store for async AI analysis (cleared on restart — fine for stateless Railway)
@@ -509,7 +509,7 @@ Respond with this exact JSON structure:
 
 app.post("/analyze/start", aiLimiter, async (req, res) => {
   if (!openai) {
-    return res.status(503).json({ error: "AI analysis not configured — OPENAI_API_KEY missing" });
+    return res.status(503).json({ error: "AI analysis not configured — OpenAI API key missing" });
   }
   try {
     const { assessResult } = req.body;
