@@ -3,6 +3,9 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import Parser from "rss-parser";
 import OpenAI from "openai";
+import { MongoClient, ObjectId } from "mongodb";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 
 const openai = (process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse)
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse })
@@ -20,10 +23,153 @@ const parser = new Parser({
 // Lock CORS to Capacitor app origins only
 app.use(cors({
   origin: ["capacitor://localhost", "https://localhost", "http://localhost"],
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type"],
+  methods: ["GET", "POST", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
+
+// ── AUTH: Mongo connection, JWT helpers, middleware ────────
+const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
+const MONGODB_URI = process.env.MONGODB_URI || "";
+
+let _mongoClient = null;
+let _db = null;
+async function getDb() {
+  if (_db) return _db;
+  if (!MONGODB_URI) throw new Error("MONGODB_URI not configured");
+  if (!_mongoClient) {
+    _mongoClient = new MongoClient(MONGODB_URI);
+    await _mongoClient.connect();
+  }
+  _db = _mongoClient.db(); // default DB from the connection string
+  // Ensure unique email index (idempotent, safe to call repeatedly)
+  try { await _db.collection("users").createIndex({ email: 1 }, { unique: true }); } catch {}
+  return _db;
+}
+
+// Shape a Mongo user doc into the object the app expects
+function publicUser(u) {
+  return { id: u._id.toString(), name: u.name, email: u.email, plan: u.plan || "free" };
+}
+
+function signToken(userId) {
+  return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+// requireAuth — validates the Bearer token and loads req.user
+async function requireAuth(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: "Not authenticated" });
+    const payload = jwt.verify(token, JWT_SECRET);
+    const db = await getDb();
+    const user = await db.collection("users").findOne({ _id: new ObjectId(payload.uid) });
+    if (!user) return res.status(401).json({ error: "Account not found" });
+    req.user = user;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "Invalid or expired session" });
+  }
+}
+
+// ── AUTH ROUTES ────────────────────────────────────────────
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const name = (req.body?.name || "").trim();
+    const email = (req.body?.email || "").trim().toLowerCase();
+    const password = req.body?.password || "";
+    if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address" });
+    if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
+    const db = await getDb();
+    const existing = await db.collection("users").findOne({ email });
+    if (existing) return res.status(409).json({ error: "An account with this email already exists" });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const doc = { name: name || email.split("@")[0], email, passwordHash, plan: "free", createdAt: new Date() };
+    const result = await db.collection("users").insertOne(doc);
+    doc._id = result.insertedId;
+
+    return res.json({ token: signToken(doc._id.toString()), user: publicUser(doc) });
+  } catch (e) {
+    if (e?.code === 11000) return res.status(409).json({ error: "An account with this email already exists" });
+    console.error("[/auth/signup]", e);
+    return res.status(500).json({ error: "Could not create account. Please try again." });
+  }
+});
+
+app.post("/auth/signin", async (req, res) => {
+  try {
+    const email = (req.body?.email || "").trim().toLowerCase();
+    const password = req.body?.password || "";
+    if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+
+    const db = await getDb();
+    const user = await db.collection("users").findOne({ email });
+    if (!user) return res.status(401).json({ error: "Incorrect email or password" });
+
+    const ok = await bcrypt.compare(password, user.passwordHash || "");
+    if (!ok) return res.status(401).json({ error: "Incorrect email or password" });
+
+    return res.json({ token: signToken(user._id.toString()), user: publicUser(user) });
+  } catch (e) {
+    console.error("[/auth/signin]", e);
+    return res.status(500).json({ error: "Could not sign in. Please try again." });
+  }
+});
+
+app.get("/auth/me", requireAuth, (req, res) => {
+  res.json(publicUser(req.user));
+});
+
+// ── SAVED ASSESSMENTS ──────────────────────────────────────
+app.get("/assessments", requireAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const list = await db.collection("assessments")
+      .find({ userId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
+    res.json(list.map(a => ({ ...a, _id: a._id.toString() })));
+  } catch (e) {
+    console.error("[GET /assessments]", e);
+    res.status(500).json({ error: "Could not load saved assessments" });
+  }
+});
+
+app.post("/assessments", requireAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    const doc = {
+      userId: req.user._id.toString(),
+      title: req.body?.title || "Assessment",
+      changeType: req.body?.changeType || "",
+      regions: Array.isArray(req.body?.regions) ? req.body.regions : [],
+      result: req.body?.result ?? null,
+      createdAt: new Date(),
+    };
+    const result = await db.collection("assessments").insertOne(doc);
+    res.json({ ...doc, _id: result.insertedId.toString() });
+  } catch (e) {
+    console.error("[POST /assessments]", e);
+    res.status(500).json({ error: "Could not save assessment" });
+  }
+});
+
+app.delete("/assessments/:id", requireAuth, async (req, res) => {
+  try {
+    const db = await getDb();
+    let _id;
+    try { _id = new ObjectId(req.params.id); } catch { return res.status(400).json({ error: "Invalid id" }); }
+    await db.collection("assessments").deleteOne({ _id, userId: req.user._id.toString() });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("[DELETE /assessments]", e);
+    res.status(500).json({ error: "Could not delete assessment" });
+  }
+});
 
 // Rate limiters — 30 req/min for news, 20 req/min for analyze
 const newsLimiter = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
