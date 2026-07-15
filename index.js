@@ -6,6 +6,7 @@ import OpenAI from "openai";
 import { MongoClient, ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 const openai = (process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse)
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse })
@@ -54,6 +55,45 @@ function publicUser(u) {
 
 function signToken(userId) {
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: "30d" });
+}
+
+// ── PASSWORD RESET config + email helper ───────────────────
+// Public base URL where the reset page is served (this backend). The emailed
+// link points here. Override with PUBLIC_URL if the domain changes.
+const PUBLIC_URL   = process.env.PUBLIC_URL || "https://regu-ai-backend-production.up.railway.app";
+const RESEND_KEY   = process.env.Resend || process.env.RESEND_API_KEY || "";
+const RESEND_FROM  = process.env.RESEND_FROM || "RegVerse <onboarding@resend.dev>";
+const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
+
+// Send the reset email via Resend's HTTP API (no SDK needed).
+async function sendResetEmail(to, link) {
+  if (!RESEND_KEY) { console.warn("[reset] Resend key not set — skipping email send"); return; }
+  const html = `<!doctype html><html><body style="margin:0;background:#f0f4f8;font-family:-apple-system,Segoe UI,sans-serif;padding:24px">
+    <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+      <div style="background:#0f172a;border-bottom:2px solid #3b82f6;padding:20px 24px;color:#fff;font-size:18px;font-weight:800">RegVerse</div>
+      <div style="padding:28px 24px;color:#0f172a">
+        <div style="font-size:19px;font-weight:800;margin-bottom:10px">Reset your password</div>
+        <div style="font-size:14px;color:#475569;line-height:1.6;margin-bottom:22px">We received a request to reset your RegVerse password. Tap the button below to set a new one. This link expires in 1 hour. If you didn't request this, you can ignore this email.</div>
+        <a href="${link}" style="display:inline-block;background:#3b82f6;color:#fff;text-decoration:none;font-size:15px;font-weight:700;padding:13px 22px;border-radius:12px">Set a new password</a>
+        <div style="font-size:12px;color:#94a3b8;line-height:1.6;margin-top:22px">Or paste this link into your browser:<br>${link}</div>
+      </div>
+    </div></body></html>`;
+  try {
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ from: RESEND_FROM, to: [to], subject: "Reset your RegVerse password", html }),
+    });
+    if (!r.ok) console.error("[reset] Resend error:", r.status, await r.text().catch(() => ""));
+  } catch (e) {
+    console.error("[reset] Resend send failed:", e);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 // requireAuth — validates the Bearer token and loads req.user
@@ -168,6 +208,99 @@ app.delete("/assessments/:id", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("[DELETE /assessments]", e);
     res.status(500).json({ error: "Could not delete assessment" });
+  }
+});
+
+// ── PASSWORD RESET ─────────────────────────────────────────
+// Always responds 200 with the same message so it never reveals whether an
+// email is registered.
+app.post("/auth/forgot-password", async (req, res) => {
+  const generic = { ok: true, message: "If an account exists for that email, a reset link is on its way." };
+  try {
+    const email = (req.body?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: "Email is required" });
+
+    const db = await getDb();
+    const user = await db.collection("users").findOne({ email });
+    if (user) {
+      const rawToken = crypto.randomBytes(32).toString("hex");
+      await db.collection("users").updateOne(
+        { _id: user._id },
+        { $set: { resetTokenHash: sha256(rawToken), resetTokenExp: Date.now() + RESET_TTL_MS } }
+      );
+      const link = `${PUBLIC_URL}/reset-password?uid=${user._id.toString()}&token=${rawToken}`;
+      await sendResetEmail(email, link);
+    }
+    return res.json(generic);
+  } catch (e) {
+    console.error("[/auth/forgot-password]", e);
+    return res.json(generic); // still generic — don't leak errors either
+  }
+});
+
+// The page the emailed link opens. Self-contained HTML, RegVerse-styled.
+app.get("/reset-password", (req, res) => {
+  const uid = escapeHtml(req.query.uid || "");
+  const token = escapeHtml(req.query.token || "");
+  res.set("Content-Type", "text/html").send(`<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Reset password · RegVerse</title></head>
+<body style="margin:0;background:#f0f4f8;font-family:-apple-system,Segoe UI,sans-serif;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:24px">
+<div style="width:100%;max-width:420px;background:#fff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden">
+  <div style="background:#0f172a;border-bottom:2px solid #3b82f6;padding:18px 22px;color:#fff;font-size:18px;font-weight:800">RegVerse</div>
+  <div style="padding:26px 22px" id="wrap">
+    <div style="font-size:20px;font-weight:800;color:#0f172a;margin-bottom:4px">Set a new password</div>
+    <div style="font-size:13px;color:#94a3b8;margin-bottom:20px">Choose a strong password for your account.</div>
+    <div id="msg" style="display:none;border-radius:10px;padding:10px 14px;font-size:13px;margin-bottom:16px"></div>
+    <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:6px">New password</label>
+    <input id="pw" type="password" placeholder="Min 6 characters" style="width:100%;box-sizing:border-box;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;font-size:14px;color:#0f172a;margin-bottom:14px;outline:none">
+    <label style="font-size:12px;font-weight:600;color:#475569;display:block;margin-bottom:6px">Confirm password</label>
+    <input id="pw2" type="password" placeholder="Re-enter password" style="width:100%;box-sizing:border-box;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;font-size:14px;color:#0f172a;margin-bottom:20px;outline:none">
+    <button id="btn" style="width:100%;background:#3b82f6;border:none;border-radius:12px;padding:14px;font-size:15px;font-weight:700;color:#fff;cursor:pointer">Reset password</button>
+  </div>
+</div>
+<script>
+  var uid=${JSON.stringify(uid)}, token=${JSON.stringify(token)};
+  var btn=document.getElementById('btn'), msg=document.getElementById('msg');
+  function show(t,ok){msg.style.display='block';msg.textContent=t;msg.style.background=ok?'#ecfdf5':'#fef2f2';msg.style.color=ok?'#047857':'#b91c1c';msg.style.border='1px solid '+(ok?'#a7f3d0':'#fecaca');}
+  btn.onclick=function(){
+    var pw=document.getElementById('pw').value, pw2=document.getElementById('pw2').value;
+    if(pw.length<6){show('Password must be at least 6 characters.',false);return;}
+    if(pw!==pw2){show('Passwords do not match.',false);return;}
+    btn.disabled=true;btn.textContent='Resetting…';
+    fetch('/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:uid,token:token,password:pw})})
+      .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
+      .then(function(x){
+        if(x.ok){document.getElementById('wrap').innerHTML='<div style="text-align:center;padding:20px 0"><div style="width:64px;height:64px;border-radius:50%;background:#ecfdf5;border:2px solid #a7f3d0;display:flex;align-items:center;justify-content:center;font-size:30px;color:#10b981;margin:0 auto 16px">✓</div><div style="font-size:19px;font-weight:800;color:#0f172a;margin-bottom:6px">Password updated</div><div style="font-size:13px;color:#475569;line-height:1.6">You can now open the RegVerse app and sign in with your new password.</div></div>';}
+        else{show((x.d&&x.d.error)||'Could not reset password.',false);btn.disabled=false;btn.textContent='Reset password';}
+      })
+      .catch(function(){show('Network error. Please try again.',false);btn.disabled=false;btn.textContent='Reset password';});
+  };
+</script></body></html>`);
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const { uid, token, password } = req.body || {};
+    if (!uid || !token || !password) return res.status(400).json({ error: "Missing fields" });
+    if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
+
+    const db = await getDb();
+    let _id;
+    try { _id = new ObjectId(uid); } catch { return res.status(400).json({ error: "This reset link is invalid." }); }
+    const user = await db.collection("users").findOne({ _id });
+    if (!user || !user.resetTokenHash || !user.resetTokenExp) return res.status(400).json({ error: "This reset link is invalid or already used." });
+    if (Date.now() > user.resetTokenExp) return res.status(400).json({ error: "This reset link has expired. Request a new one." });
+    if (sha256(token) !== user.resetTokenHash) return res.status(400).json({ error: "This reset link is invalid." });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await db.collection("users").updateOne(
+      { _id },
+      { $set: { passwordHash }, $unset: { resetTokenHash: "", resetTokenExp: "" } }
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[/auth/reset-password]", e);
+    return res.status(500).json({ error: "Could not reset password. Please try again." });
   }
 });
 
