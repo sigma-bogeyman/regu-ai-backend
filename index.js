@@ -2,6 +2,14 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import Parser from "rss-parser";
+import OpenAI from "openai";
+
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
+// In-memory job store for async AI analysis (cleared on restart — fine for stateless Railway)
+const aiJobs = new Map(); // jobId -> { status, result, error }
 
 const app = express();
 const parser = new Parser({
@@ -440,6 +448,111 @@ app.post("/analyze", analyzeLimiter, (req, res) => {
     console.error("[/analyze] error:", e);
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+
+// ── AI ANALYSIS — async job queue ────────────────────────────────────────────
+const aiLimiter = rateLimit({ windowMs: 60_000, max: 10, standardHeaders: true, legacyHeaders: false });
+
+function buildPharmaPrompt(assessResult) {
+  return `You are a senior regulatory affairs expert specialising in pharmaceutical post-approval change management (ICH Q10, EU Variations Regulation 1234/2008, FDA CMC guidance).
+
+A regulatory assessment has been run. Provide expert insight as valid JSON only — no markdown, no prose outside the JSON.
+
+Assessment context:
+- Product type: ${assessResult.productType || "Pharmaceutical"}
+- Change: ${assessResult.title || assessResult.code || "Unknown change"}
+- Sub-section: ${assessResult.subSectionLabel || ""}
+- Condition: ${assessResult.subTypeDesc || ""}
+- EU variation type: ${assessResult.euType || ""}
+- Severity: ${assessResult.severity || ""}
+- Territories: ${(assessResult.selectedRegions || []).join(", ")}
+
+Respond with this exact JSON structure:
+{
+  "keyPoints": [
+    "3 to 5 specific, actionable regulatory insights for this change — cite ICH guidelines, CTD modules, or agency-specific requirements",
+    "Include data package expectations, timing requirements, or known agency stances on this change type",
+    "Mention any common pitfalls or reviewer focus areas for this variation type"
+  ],
+  "strategicInsight": "One paragraph of strategic advice — e.g. sequencing submissions, leveraging prior approvals, clock-stop risk, or parallel submission strategy"
+}`;
+}
+
+function buildMDPrompt(assessResult) {
+  const filingsSummary = (assessResult.filings || [])
+    .map(f => `${f.territory} (${f.agency}): ${f.action?.label} — ${f.action?.timeline}`)
+    .join("\n");
+
+  return `You are a senior regulatory affairs consultant specialising in medical device regulation (EU MDR 2017/745, MDCG 2020-3, FDA 21 CFR Part 820, ISO 13485, ISO 14971).
+
+A device change assessment has been completed. Provide expert insight as valid JSON only — no markdown, no prose outside the JSON.
+
+Assessment context:
+- Device class: ${assessResult.mdDeviceClass || ""}
+- Change type: ${assessResult.changeLabel || assessResult.mdChangeType || ""}
+- Territories assessed: ${(assessResult.selectedRegions || []).join(", ")}
+- Filing requirements:
+${filingsSummary}
+
+Respond with this exact JSON structure:
+{
+  "keyPoints": [
+    "3 to 5 specific, actionable insights — cite MDCG guidance documents, ISO standards, or FDA guidance as appropriate",
+    "Address whether this change is likely to cross the 'significant change' threshold under MDCG 2020-3 or FDA significant-change guidance",
+    "Include Notified Body expectations, Technical Documentation requirements, or clinical evaluation update needs",
+    "Mention any risk management (ISO 14971) or V&V considerations specific to this change type"
+  ],
+  "strategicInsight": "One paragraph of strategic advice — e.g. engaging Notified Body early, PMCF implications, parallel filing strategy, or how to frame the change to minimise regulatory burden"
+}`;
+}
+
+app.post("/analyze/start", aiLimiter, async (req, res) => {
+  if (!openai) {
+    return res.status(503).json({ error: "AI analysis not configured — OPENAI_API_KEY missing" });
+  }
+  try {
+    const { assessResult } = req.body;
+    if (!assessResult || typeof assessResult !== "object") {
+      return res.status(400).json({ error: "assessResult is required" });
+    }
+
+    const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    aiJobs.set(jobId, { status: "pending" });
+
+    // Run AI generation asynchronously — don't await here
+    const isMD = assessResult.productType === "Medical Device";
+    const prompt = isMD ? buildMDPrompt(assessResult) : buildPharmaPrompt(assessResult);
+
+    (async () => {
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" },
+        });
+        const text = completion.choices[0].message.content.trim();
+        const parsed = JSON.parse(text);
+        aiJobs.set(jobId, { status: "done", result: parsed });
+      } catch (e) {
+        console.error("[AI job error]", e.message);
+        aiJobs.set(jobId, { status: "error", error: e.message });
+      }
+      // Clean up after 10 minutes
+      setTimeout(() => aiJobs.delete(jobId), 10 * 60 * 1000);
+    })();
+
+    res.json({ jobId });
+  } catch (e) {
+    console.error("[/analyze/start]", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/analyze/status/:jobId", (req, res) => {
+  const job = aiJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ status: "not_found" });
+  res.json(job);
 });
 
 
