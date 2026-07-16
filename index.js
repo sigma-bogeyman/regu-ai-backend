@@ -7,6 +7,7 @@ import { MongoClient, ObjectId } from "mongodb";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import { registerForumRoutes } from "./forum.js";
 
 const openai = (process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse)
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse })
@@ -934,6 +935,9 @@ app.get("/analyze/status/:jobId", (req, res) => {
   res.json(job);
 });
 
+
+// The Exchange (community forum) — additive routes under /exchange
+registerForumRoutes(app, { getDb, requireAuth });
 
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, "0.0.0.0", () => {
