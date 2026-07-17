@@ -233,4 +233,43 @@ export function registerForumRoutes(app, { getDb, requireAuth }) {
   };
   app.delete("/exchange/threads/:id", requireAuth, remove("forum_threads"));
   app.delete("/exchange/replies/:id", requireAuth, remove("forum_replies"));
+
+  // ── ADMIN moderation ────────────────────────────────────
+  const requireAdmin = (req, res, next) => {
+    if (!isAdmin(req.user)) return res.status(403).json({ error: "Admins only." });
+    next();
+  };
+
+  // Reports queue — every non-removed thread/reply that has at least one report.
+  app.get("/exchange/admin/reports", requireAuth, requireAdmin, async (req, res) => {
+    try {
+      const db = await getDb();
+      const [threads, replies] = await Promise.all([
+        db.collection("forum_threads").find({ status: { $ne: "removed" }, "reports.0": { $exists: true } }).toArray(),
+        db.collection("forum_replies").find({ status: { $ne: "removed" }, "reports.0": { $exists: true } }).toArray(),
+      ]);
+      const items = [
+        ...threads.map(t => ({ kind: "thread", id: t._id.toString(), title: t.title, body: t.body, author: t.authorName, category: t.category, reports: t.reports || [], reportCount: (t.reports || []).length, createdAt: t.createdAt })),
+        ...replies.map(r => ({ kind: "reply", id: r._id.toString(), threadId: r.threadId, body: r.body, author: r.authorName, reports: r.reports || [], reportCount: (r.reports || []).length, createdAt: r.createdAt })),
+      ].sort((a, b) => b.reportCount - a.reportCount || new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      res.json(items);
+    } catch (e) {
+      console.error("[/exchange/admin/reports]", e);
+      res.status(500).json({ error: "Could not load reports." });
+    }
+  });
+
+  // Dismiss reports on an item (keeps the content, clears the flags).
+  app.post("/exchange/admin/dismiss/:kind/:id", requireAuth, requireAdmin, async (req, res) => {
+    try {
+      const coll = req.params.kind === "reply" ? "forum_replies" : "forum_threads";
+      let _id; try { _id = new ObjectId(req.params.id); } catch { return res.status(400).json({ error: "Invalid id" }); }
+      const db = await getDb();
+      await db.collection(coll).updateOne({ _id }, { $set: { reports: [] } });
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("[/exchange/admin/dismiss]", e);
+      res.status(500).json({ error: "Could not dismiss." });
+    }
+  });
 }

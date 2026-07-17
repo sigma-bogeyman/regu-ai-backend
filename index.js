@@ -49,9 +49,19 @@ async function getDb() {
   return _db;
 }
 
+// Admin allow-list (comma-separated env, defaults to the owner). Used for moderation.
+const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "abinesh345@gmail.com")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+
 // Shape a Mongo user doc into the object the app expects
 function publicUser(u) {
-  return { id: u._id.toString(), name: u.name, email: u.email, plan: u.plan || "free" };
+  return {
+    id: u._id.toString(),
+    name: u.name,
+    email: u.email,
+    plan: u.plan || "free",
+    admin: ADMIN_EMAILS.includes((u.email || "").toLowerCase()),
+  };
 }
 
 function signToken(userId) {
