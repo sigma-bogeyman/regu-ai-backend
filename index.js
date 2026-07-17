@@ -64,6 +64,22 @@ function publicUser(u) {
   };
 }
 
+// ── Subscription products & entitlements ──────────────────────
+const PRODUCT_ADFREE = "regverse_adfree_yearly"; // ₹199 — removes ads only
+const PRODUCT_PRO    = "regverse_pro_yearly";    // ₹349 — all features + no ads
+// Map a Google Play productId to the plan we store on the user.
+// Legacy single product (regverse_premium_yearly) counts as full Pro.
+function planForProduct(pid) {
+  return pid === PRODUCT_ADFREE ? "adfree" : "pro";
+}
+// Pro entitlement = unlocks paid features (Expert Analysis, Mind Maps, Submission Tracker).
+// Ad-Free (₹199) is NOT Pro. Admins are always Pro.
+function isProUser(u) {
+  if (!u) return false;
+  if (ADMIN_EMAILS.includes((u.email || "").toLowerCase())) return true;
+  return u.plan === "pro" || u.plan === "premium";
+}
+
 function signToken(userId) {
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: "30d" });
 }
@@ -387,10 +403,11 @@ app.post("/auth/upgrade-premium", requireAuth, async (req, res) => {
       catch (e) { console.error("[upgrade-premium] acknowledge:", e); }
     }
 
+    const plan = planForProduct(productId); // "adfree" (₹199) or "pro" (₹349 / legacy)
     const db = await getDb();
     await db.collection("users").updateOne(
       { _id: req.user._id },
-      { $set: { plan: "premium", subscription: { productId, purchaseToken, expiryTimeMillis: sub.expiryTimeMillis, updatedAt: new Date() } } }
+      { $set: { plan, subscription: { productId, purchaseToken, expiryTimeMillis: sub.expiryTimeMillis, updatedAt: new Date() } } }
     );
     const fresh = await db.collection("users").findOne({ _id: req.user._id });
     return res.json({ token: signToken(fresh._id.toString()), user: publicUser(fresh) });
@@ -897,7 +914,12 @@ ${filingsSummary}
 ${insightContract(regions, "device")}`;
 }
 
-app.post("/analyze/start", aiLimiter, async (req, res) => {
+app.post("/analyze/start", aiLimiter, requireAuth, async (req, res) => {
+  // Expert Analysis is a Pro-only feature. Gate here so Free/Ad-Free accounts
+  // can NEVER trigger an OpenAI call (no token cost), even via a direct API hit.
+  if (!isProUser(req.user)) {
+    return res.status(403).json({ error: "Expert Analysis is a Pro feature.", code: "pro_required" });
+  }
   if (!openai) {
     return res.status(503).json({ error: "AI analysis not configured — OpenAI API key missing" });
   }
