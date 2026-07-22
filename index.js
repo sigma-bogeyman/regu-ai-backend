@@ -30,6 +30,18 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Brute-force protection on credential endpoints. Defined here (before the auth
+// routes below) so it is initialised by the time those routes are registered.
+// 10 attempts per IP per 15 min covers honest typos but stops password spraying
+// and stops /auth/forgot-password being used to spam email (and burn Resend credit).
+const authLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts. Please wait a few minutes and try again." },
+});
+
 // ── AUTH: Mongo connection, JWT helpers, middleware ────────
 const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
 const MONGODB_URI = process.env.MONGODB_URI || "";
@@ -185,7 +197,7 @@ async function requireAuth(req, res, next) {
 }
 
 // ── AUTH ROUTES ────────────────────────────────────────────
-app.post("/auth/signup", async (req, res) => {
+app.post("/auth/signup", authLimiter, async (req, res) => {
   try {
     const name = (req.body?.name || "").trim();
     const email = (req.body?.email || "").trim().toLowerCase();
@@ -211,7 +223,7 @@ app.post("/auth/signup", async (req, res) => {
   }
 });
 
-app.post("/auth/signin", async (req, res) => {
+app.post("/auth/signin", authLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
     const password = req.body?.password || "";
@@ -285,7 +297,7 @@ app.delete("/assessments/:id", requireAuth, async (req, res) => {
 // ── PASSWORD RESET ─────────────────────────────────────────
 // Always responds 200 with the same message so it never reveals whether an
 // email is registered.
-app.post("/auth/forgot-password", async (req, res) => {
+app.post("/auth/forgot-password", authLimiter, async (req, res) => {
   const generic = { ok: true, message: "If an account exists for that email, a reset link is on its way." };
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
@@ -456,7 +468,9 @@ const FEEDS = [
   },
   {
     agency: "EMA",
-    url: GN("\"European Medicines Agency\" EMA regulatory approval"),
+    // NOTE: do NOT include the bare token "EMA" — it also means "Exponential Moving
+    // Average" (a stock indicator) and pulls in finance articles. Full name only.
+    url: GN("\"European Medicines Agency\" medicines regulatory"),
     homeLink: "https://www.ema.europa.eu",
   },
   {
@@ -604,18 +618,52 @@ _initialStatic.sort((a, b) => new Date(b.date) - new Date(a.date));
 // Mark ts as stale (0) so the first real request will trigger a live refresh
 let newsCache = { data: _initialStatic, ts: 0 };
 
+// ── News relevance filter ─────────────────────────────────────
+// Google News keyword feeds occasionally return off-topic items — most often
+// finance/stock articles that match an ambiguous acronym (e.g. "EMA" also means
+// the Exponential Moving Average stock indicator). This drops anything clearly
+// non-regulatory by title pattern AND by source, so junk can't leak through no
+// matter which feed produced it. Exclusion-only (a denylist), so it won't drop
+// genuine regulatory headlines. If an agency ends up empty after filtering, the
+// existing static-fallback logic fills it with curated items.
+const FINANCE_TITLE_RE = /\b(stocks?|shares?|nasdaq|nyse|nyse:|portfolio|dividend|price target|buy rating|sell rating|market ?cap|hedge funds?|bullish|bearish|moving average|should you buy|is it a buy|earnings call|short interest|analyst price|upgraded to buy|downgraded to)\b/i;
+const BLOCKED_NEWS_SOURCES = [
+  "tradingview", "motley fool", "zacks", "marketbeat", "benzinga", "simply wall st",
+  "seeking alpha", "insider monkey", "tipranks", "investorplace", "stocktwits",
+  "barchart", "gurufocus", "wallstreetzen", "stocktitan", "market screener",
+  "defense world", "etf daily news", "the cerbat gem", "modern readers",
+];
+function isRelevantArticle(title, link) {
+  const t = title || "";
+  if (FINANCE_TITLE_RE.test(t)) return false;
+  // Google News titles end with " - <Publisher>"; block by publisher name.
+  const dash = t.lastIndexOf(" - ");
+  if (dash > 0) {
+    const src = t.slice(dash + 3).trim().toLowerCase();
+    if (BLOCKED_NEWS_SOURCES.some((s) => src === s || src.includes(s))) return false;
+  }
+  try {
+    const host = new URL(link).hostname.replace(/^www\./, "").toLowerCase();
+    if (BLOCKED_NEWS_SOURCES.some((s) => host.includes(s.replace(/\s+/g, "")))) return false;
+  } catch { /* unparseable link — title checks already applied */ }
+  return true;
+}
+
 async function buildNewsFeed() {
   // Fetch all RSS feeds in parallel — failures are caught individually
   const results = await Promise.allSettled(
     FEEDS.map(async ({ agency, url, homeLink }) => {
       const feed = await parser.parseURL(url);
-      return (feed.items || []).slice(0, 25).map((item) => ({
-        agency,
-        title: item.title?.replace(/<[^>]*>/g, "").trim() || "No title",
-        date: item.pubDate || item.isoDate || new Date().toISOString(),
-        link: item.link || homeLink,
-        source: "live",
-      }));
+      return (feed.items || [])
+        .map((item) => ({
+          agency,
+          title: item.title?.replace(/<[^>]*>/g, "").trim() || "No title",
+          date: item.pubDate || item.isoDate || new Date().toISOString(),
+          link: item.link || homeLink,
+          source: "live",
+        }))
+        .filter((a) => isRelevantArticle(a.title, a.link)) // drop finance/off-topic junk
+        .slice(0, 25);
     })
   );
 
