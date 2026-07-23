@@ -24,7 +24,7 @@ const parser = new Parser({
 
 // Lock CORS to Capacitor app origins only
 app.use(cors({
-  origin: ["capacitor://localhost", "https://localhost", "http://localhost"],
+  origin: ["capacitor://localhost", "https://localhost", "http://localhost", "https://regverse.app", "https://www.regverse.app", /\.netlify\.app$/],
   methods: ["GET", "POST", "DELETE"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
