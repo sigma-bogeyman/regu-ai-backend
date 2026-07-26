@@ -1,4 +1,3 @@
-Index · JS
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -9,20 +8,20 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { registerForumRoutes } from "./forum.js";
- 
+
 const openai = (process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse)
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY || process.env.Open_AI_RegVerse })
   : null;
- 
+
 // In-memory job store for async AI analysis (cleared on restart — fine for stateless Railway)
 const aiJobs = new Map(); // jobId -> { status, result, error }
- 
+
 const app = express();
 const parser = new Parser({
   timeout: 6000,
   headers: { "User-Agent": "RegVerse/1.0 (regulatory-intelligence-app)" },
 });
- 
+
 // Allowed origins: Capacitor mobile app + RegVerse web app (regverse.app, its
 // www, and any *.netlify.app address used while the domain connects / previews).
 app.use(cors({
@@ -31,7 +30,7 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
- 
+
 // Brute-force protection on credential endpoints. Defined here (before the auth
 // routes below) so it is initialised by the time those routes are registered.
 // 10 attempts per IP per 15 min covers honest typos but stops password spraying
@@ -43,11 +42,11 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many attempts. Please wait a few minutes and try again." },
 });
- 
+
 // ── AUTH: Mongo connection, JWT helpers, middleware ────────
 const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
 const MONGODB_URI = process.env.MONGODB_URI || "";
- 
+
 let _mongoClient = null;
 let _db = null;
 async function getDb() {
@@ -62,11 +61,11 @@ async function getDb() {
   try { await _db.collection("users").createIndex({ email: 1 }, { unique: true }); } catch {}
   return _db;
 }
- 
+
 // Admin allow-list (comma-separated env, defaults to the owner). Used for moderation.
 const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || "abinesh345@gmail.com")
   .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
- 
+
 // Shape a Mongo user doc into the object the app expects
 function publicUser(u) {
   return {
@@ -77,7 +76,7 @@ function publicUser(u) {
     admin: ADMIN_EMAILS.includes((u.email || "").toLowerCase()),
   };
 }
- 
+
 // ── Subscription products & entitlements ──────────────────────
 const PRODUCT_ADFREE = "regverse_adfree_yearly"; // ₹199 — removes ads only
 const PRODUCT_PRO    = "regverse_pro_yearly";    // ₹349 — all features + no ads
@@ -93,11 +92,11 @@ function isProUser(u) {
   if (ADMIN_EMAILS.includes((u.email || "").toLowerCase())) return true;
   return u.plan === "pro" || u.plan === "premium";
 }
- 
+
 function signToken(userId) {
   return jwt.sign({ uid: userId }, JWT_SECRET, { expiresIn: "30d" });
 }
- 
+
 // ── PASSWORD RESET config + email helper ───────────────────
 // Public base URL where the reset page is served (this backend). The emailed
 // link points here. Override with PUBLIC_URL if the domain changes.
@@ -105,9 +104,9 @@ const PUBLIC_URL   = process.env.PUBLIC_URL || "https://regu-ai-backend-producti
 const RESEND_KEY   = process.env.Resend || process.env.RESEND_API_KEY || "";
 const RESEND_FROM  = process.env.RESEND_FROM || "RegVerse <onboarding@resend.dev>";
 const RESET_TTL_MS = 60 * 60 * 1000; // 1 hour
- 
+
 const sha256 = (s) => crypto.createHash("sha256").update(s).digest("hex");
- 
+
 // Send the reset email via Resend's HTTP API (no SDK needed).
 async function sendResetEmail(to, link) {
   if (!RESEND_KEY) { console.warn("[reset] Resend key not set — skipping email send"); return; }
@@ -132,17 +131,17 @@ async function sendResetEmail(to, link) {
     console.error("[reset] Resend send failed:", e);
   }
 }
- 
+
 function escapeHtml(s) {
   return String(s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
- 
+
 // ── GOOGLE PLAY BILLING verification (server-side) ─────────
 const ANDROID_PACKAGE     = process.env.ANDROID_PACKAGE_NAME || "com.regverse.app";
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
 // Railway stores the PEM with literal \n — turn them back into real newlines.
 const GOOGLE_PRIVATE_KEY  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
- 
+
 let _gTok = { token: null, exp: 0 };
 // Exchange the service-account key for a short-lived Google API access token.
 async function getGoogleAccessToken() {
@@ -163,7 +162,7 @@ async function getGoogleAccessToken() {
   _gTok = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
   return data.access_token;
 }
- 
+
 // GET a subscription purchase's status from the Play Developer API.
 async function getSubscription(productId, token) {
   const access = await getGoogleAccessToken();
@@ -173,14 +172,14 @@ async function getSubscription(productId, token) {
   if (!r.ok) throw new Error("subscription verify failed: " + JSON.stringify(data));
   return data; // { paymentState, expiryTimeMillis, acknowledgementState, ... }
 }
- 
+
 // Acknowledge a purchase (required within 3 days or Google auto-refunds).
 async function acknowledgeSubscription(productId, token) {
   const access = await getGoogleAccessToken();
   const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${ANDROID_PACKAGE}/purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(token)}:acknowledge`;
   await fetch(url, { method: "POST", headers: { Authorization: `Bearer ${access}`, "Content-Type": "application/json" }, body: "{}" });
 }
- 
+
 // requireAuth — validates the Bearer token and loads req.user
 async function requireAuth(req, res, next) {
   try {
@@ -197,7 +196,7 @@ async function requireAuth(req, res, next) {
     return res.status(401).json({ error: "Invalid or expired session" });
   }
 }
- 
+
 // ── AUTH ROUTES ────────────────────────────────────────────
 app.post("/auth/signup", authLimiter, async (req, res) => {
   try {
@@ -207,16 +206,16 @@ app.post("/auth/signup", authLimiter, async (req, res) => {
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address" });
     if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
- 
+
     const db = await getDb();
     const existing = await db.collection("users").findOne({ email });
     if (existing) return res.status(409).json({ error: "An account with this email already exists" });
- 
+
     const passwordHash = await bcrypt.hash(password, 10);
     const doc = { name: name || email.split("@")[0], email, passwordHash, plan: "free", createdAt: new Date() };
     const result = await db.collection("users").insertOne(doc);
     doc._id = result.insertedId;
- 
+
     return res.json({ token: signToken(doc._id.toString()), user: publicUser(doc) });
   } catch (e) {
     if (e?.code === 11000) return res.status(409).json({ error: "An account with this email already exists" });
@@ -224,31 +223,31 @@ app.post("/auth/signup", authLimiter, async (req, res) => {
     return res.status(500).json({ error: "Could not create account. Please try again." });
   }
 });
- 
+
 app.post("/auth/signin", authLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
     const password = req.body?.password || "";
     if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
- 
+
     const db = await getDb();
     const user = await db.collection("users").findOne({ email });
     if (!user) return res.status(401).json({ error: "Incorrect email or password" });
- 
+
     const ok = await bcrypt.compare(password, user.passwordHash || "");
     if (!ok) return res.status(401).json({ error: "Incorrect email or password" });
- 
+
     return res.json({ token: signToken(user._id.toString()), user: publicUser(user) });
   } catch (e) {
     console.error("[/auth/signin]", e);
     return res.status(500).json({ error: "Could not sign in. Please try again." });
   }
 });
- 
+
 app.get("/auth/me", requireAuth, (req, res) => {
   res.json(publicUser(req.user));
 });
- 
+
 // ── SAVED ASSESSMENTS ──────────────────────────────────────
 app.get("/assessments", requireAuth, async (req, res) => {
   try {
@@ -263,7 +262,7 @@ app.get("/assessments", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not load saved assessments" });
   }
 });
- 
+
 app.post("/assessments", requireAuth, async (req, res) => {
   try {
     const db = await getDb();
@@ -282,7 +281,7 @@ app.post("/assessments", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not save assessment" });
   }
 });
- 
+
 app.delete("/assessments/:id", requireAuth, async (req, res) => {
   try {
     const db = await getDb();
@@ -295,7 +294,7 @@ app.delete("/assessments/:id", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Could not delete assessment" });
   }
 });
- 
+
 // ── PASSWORD RESET ─────────────────────────────────────────
 // Always responds 200 with the same message so it never reveals whether an
 // email is registered.
@@ -304,7 +303,7 @@ app.post("/auth/forgot-password", authLimiter, async (req, res) => {
   try {
     const email = (req.body?.email || "").trim().toLowerCase();
     if (!email) return res.status(400).json({ error: "Email is required" });
- 
+
     const db = await getDb();
     const user = await db.collection("users").findOne({ email });
     if (user) {
@@ -322,7 +321,7 @@ app.post("/auth/forgot-password", authLimiter, async (req, res) => {
     return res.json(generic); // still generic — don't leak errors either
   }
 });
- 
+
 // The page the emailed link opens. Self-contained HTML, RegVerse-styled.
 app.get("/reset-password", (req, res) => {
   const uid = escapeHtml(req.query.uid || "");
@@ -362,13 +361,13 @@ app.get("/reset-password", (req, res) => {
   };
 </script></body></html>`);
 });
- 
+
 app.post("/auth/reset-password", async (req, res) => {
   try {
     const { uid, token, password } = req.body || {};
     if (!uid || !token || !password) return res.status(400).json({ error: "Missing fields" });
     if (String(password).length < 6) return res.status(400).json({ error: "Password must be at least 6 characters" });
- 
+
     const db = await getDb();
     let _id;
     try { _id = new ObjectId(uid); } catch { return res.status(400).json({ error: "This reset link is invalid." }); }
@@ -376,7 +375,7 @@ app.post("/auth/reset-password", async (req, res) => {
     if (!user || !user.resetTokenHash || !user.resetTokenExp) return res.status(400).json({ error: "This reset link is invalid or already used." });
     if (Date.now() > user.resetTokenExp) return res.status(400).json({ error: "This reset link has expired. Request a new one." });
     if (sha256(token) !== user.resetTokenHash) return res.status(400).json({ error: "This reset link is invalid." });
- 
+
     const passwordHash = await bcrypt.hash(password, 10);
     await db.collection("users").updateOne(
       { _id },
@@ -388,7 +387,7 @@ app.post("/auth/reset-password", async (req, res) => {
     return res.status(500).json({ error: "Could not reset password. Please try again." });
   }
 });
- 
+
 // ── UPGRADE TO PREMIUM (verify Google Play purchase) ───────
 // The app sends the Google purchaseToken here after a successful buy/restore.
 // We verify it server-side, acknowledge it, mark the user premium, and return
@@ -397,7 +396,7 @@ app.post("/auth/upgrade-premium", requireAuth, async (req, res) => {
   try {
     const { purchaseToken, productId } = req.body || {};
     if (!purchaseToken || !productId) return res.status(400).json({ error: "Missing purchase details" });
- 
+
     let sub;
     try {
       sub = await getSubscription(productId, purchaseToken);
@@ -405,18 +404,18 @@ app.post("/auth/upgrade-premium", requireAuth, async (req, res) => {
       console.error("[upgrade-premium] verify:", e);
       return res.status(400).json({ error: "Could not verify this purchase with Google Play. Please try again." });
     }
- 
+
     // paymentState: 0 pending, 1 received, 2 free trial, 3 deferred
     const paid = sub.paymentState === 1 || sub.paymentState === 2;
     const notExpired = Number(sub.expiryTimeMillis || 0) > Date.now();
     if (!paid || !notExpired) return res.status(400).json({ error: "This subscription is not active." });
- 
+
     // Acknowledge if Google hasn't seen an ack yet (required within 3 days).
     if (sub.acknowledgementState === 0) {
       try { await acknowledgeSubscription(productId, purchaseToken); }
       catch (e) { console.error("[upgrade-premium] acknowledge:", e); }
     }
- 
+
     const plan = planForProduct(productId); // "adfree" (₹199) or "pro" (₹349 / legacy)
     const db = await getDb();
     await db.collection("users").updateOne(
@@ -430,7 +429,7 @@ app.post("/auth/upgrade-premium", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Could not complete the upgrade. Please try again." });
   }
 });
- 
+
 // ── RAZORPAY (web payments on regverse.app) ────────────────
 // The website sells the two plans via Razorpay (one-time annual). The Android
 // app keeps using Google Play Billing (/auth/upgrade-premium above) — these
@@ -445,7 +444,7 @@ const RZP_PLANS = {
   adfree: { amount: 19900, plan: "adfree" }, // ₹199.00
   pro:    { amount: 34900, plan: "pro" },    // ₹349.00
 };
- 
+
 // 1) Create an order for the chosen plan.
 app.post("/razorpay/order", requireAuth, async (req, res) => {
   try {
@@ -453,7 +452,7 @@ app.post("/razorpay/order", requireAuth, async (req, res) => {
     const planKey = String(req.body?.plan || "").toLowerCase();
     const cfg = RZP_PLANS[planKey];
     if (!cfg) return res.status(400).json({ error: "Unknown plan." });
- 
+
     const auth = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString("base64");
     const rzpRes = await fetch("https://api.razorpay.com/v1/orders", {
       method: "POST",
@@ -476,7 +475,7 @@ app.post("/razorpay/order", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Could not start the payment. Please try again." });
   }
 });
- 
+
 // 2) Verify the completed payment's signature, then activate the plan.
 app.post("/razorpay/verify", requireAuth, async (req, res) => {
   try {
@@ -485,14 +484,14 @@ app.post("/razorpay/verify", requireAuth, async (req, res) => {
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) return res.status(400).json({ error: "Missing payment details." });
     const planKey = String(plan || "").toLowerCase();
     if (!RZP_PLANS[planKey]) return res.status(400).json({ error: "Unknown plan." });
- 
+
     const expected = crypto.createHmac("sha256", RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
     const sigOk = expected.length === String(razorpay_signature).length &&
       crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(razorpay_signature)));
     if (!sigOk) return res.status(400).json({ error: "Payment could not be verified." });
- 
+
     const expiry = Date.now() + 365 * 24 * 60 * 60 * 1000; // 1 year
     const db = await getDb();
     await db.collection("users").updateOne(
@@ -506,24 +505,24 @@ app.post("/razorpay/verify", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Could not confirm the payment. Please try again." });
   }
 });
- 
+
 // Rate limiters — 30 req/min for news, 20 req/min for analyze
 const newsLimiter = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false });
 const analyzeLimiter = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false });
- 
- 
+
+
 // ── HOME ROUTE ────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("RegRadar backend running");
 });
- 
- 
+
+
 // ── RSS FEED DEFINITIONS ──────────────────────────────────
 // Official feeds where confirmed working; Google News RSS for the rest
 // Google News RSS is always available and never blocks
 const GN = (q) =>
   `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=en-US&gl=US&ceid=US:en`;
- 
+
 // LIVE_FEEDS: agencies with reliable RSS (official or Google News with unambiguous search terms)
 const FEEDS = [
   // Official — confirmed working
@@ -537,7 +536,7 @@ const FEEDS = [
     url: "https://www.gov.br/anvisa/en/@@rss.xml",
     homeLink: "https://www.gov.br/anvisa/en",
   },
- 
+
   // Google News RSS — reliable fallback for agencies with unambiguous search terms
   {
     agency: "FDA",
@@ -582,14 +581,14 @@ const FEEDS = [
     homeLink: "https://cdsco.gov.in",
   },
 ];
- 
+
 // STATIC_ONLY_AGENCIES: these are guaranteed via static data (their names are too ambiguous
 // for Google News or their RSS feeds are not publicly available in English)
 const STATIC_ONLY_AGENCIES = new Set([
   "Medsafe", "NPRA", "HSA", "MFDS", "NMPA", "SFDA", "UAE Health", "Qatar MOPH",
 ]);
- 
- 
+
+
 // ── STATIC FALLBACK (used when an RSS feed fails) ─────────
 const STATIC_FALLBACK = {
   FDA: [
@@ -683,11 +682,11 @@ const STATIC_FALLBACK = {
     { title: "Qatar MOPH strengthens pharmacovigilance reporting for market authorisation holders", date: "2026-04-08", link: "https://www.moph.gov.qa/english" },
   ],
 };
- 
- 
+
+
 // ── CACHE (15 min TTL) ────────────────────────────────────
 const CACHE_TTL = 15 * 60 * 1000;
- 
+
 // Pre-fill cache with static data so the very first app request responds instantly
 const _initialStatic = Object.entries(STATIC_FALLBACK).flatMap(([agency, items]) =>
   items.map((s) => ({ ...s, agency, source: "static" }))
@@ -695,7 +694,7 @@ const _initialStatic = Object.entries(STATIC_FALLBACK).flatMap(([agency, items])
 _initialStatic.sort((a, b) => new Date(b.date) - new Date(a.date));
 // Mark ts as stale (0) so the first real request will trigger a live refresh
 let newsCache = { data: _initialStatic, ts: 0 };
- 
+
 // ── News relevance filter ─────────────────────────────────────
 // Google News keyword feeds occasionally return off-topic items — most often
 // finance/stock articles that match an ambiguous acronym (e.g. "EMA" also means
@@ -726,7 +725,7 @@ function isRelevantArticle(title, link) {
   } catch { /* unparseable link — title checks already applied */ }
   return true;
 }
- 
+
 async function buildNewsFeed() {
   // Fetch all RSS feeds in parallel — failures are caught individually
   const results = await Promise.allSettled(
@@ -744,10 +743,10 @@ async function buildNewsFeed() {
         .slice(0, 25);
     })
   );
- 
+
   const articles = [];
   const liveAgencies = new Set();
- 
+
   results.forEach((result, i) => {
     const { agency } = FEEDS[i];
     if (result.status === "fulfilled" && result.value.length > 0) {
@@ -759,7 +758,7 @@ async function buildNewsFeed() {
       console.log(`✗ ${agency}: ${reason} — using static fallback`);
     }
   });
- 
+
   // Fill in static fallback for:
   //  a) any live-feed agency where RSS failed, AND
   //  b) ALL static-only agencies (always guaranteed)
@@ -768,21 +767,21 @@ async function buildNewsFeed() {
       articles.push(...statics.map((s) => ({ ...s, agency, source: "static" })));
     }
   }
- 
+
   articles.sort((a, b) => new Date(b.date) - new Date(a.date));
   return articles;
 }
- 
- 
+
+
 // ── NEWS ROUTE ────────────────────────────────────────────
 app.get("/news", newsLimiter, async (req, res) => {
   const now = Date.now();
- 
+
   // Always respond immediately with whatever is cached (static or live)
   if (newsCache.data) {
     res.json(newsCache.data);
   }
- 
+
   // If cache is stale, refresh in background (or foreground if nothing cached yet)
   if (now - newsCache.ts >= CACHE_TTL) {
     const deadline = new Promise((_, reject) =>
@@ -800,21 +799,21 @@ app.get("/news", newsLimiter, async (req, res) => {
       });
   }
 });
- 
- 
+
+
 // ── ANALYZE ROUTE ─────────────────────────────────────────
- 
+
 // Severity matrix: changeType + riskFlags → High / Medium / Low
 function calcSeverity(changeType, flags) {
   const highTypes = ["Site Transfer", "Process Change", "Formulation Change", "Excipient Change"];
   const medTypes  = ["Specification Change", "Analytical Method Change", "Shelf Life Extension",
                      "Container Closure Change", "Scale-up / Scale-down"];
- 
+
   if (highTypes.includes(changeType) || flags.cqa || flags.impurity || flags.sterility) return "High";
   if (medTypes.includes(changeType)  || flags.validation) return "Medium";
   return "Low";
 }
- 
+
 // Per-region filing matrix
 const REGIONAL_MATRIX = {
   FDA: {
@@ -858,13 +857,13 @@ const REGIONAL_MATRIX = {
     Low:    { filing: "Notification / Annual Statement",          timeline: "1–3 months",   note: "Notify CDSCO via SUGAM portal; retain supporting data." },
   },
 };
- 
+
 // CTD section mapping by change type + applies-to
 function getCTDSections(changeType, appliesTo) {
   const isDS   = appliesTo === "Drug Substance (DS)";
   const isDP   = appliesTo === "Drug Product (DP)";
   const isBoth = !isDS && !isDP; // "Both DS & DP" or default
- 
+
   const DS_sections = {
     "Process Change":           ["3.2.S.2.2", "3.2.S.2.3", "3.2.S.2.4", "3.2.S.2.5", "3.2.S.4.4"],
     "Site Transfer":            ["3.2.S.2.1", "3.2.S.2.2", "3.2.S.2.6", "GMP Certificate (3.2.R)"],
@@ -877,7 +876,7 @@ function getCTDSections(changeType, appliesTo) {
     "Scale-up / Scale-down":    ["3.2.S.2.2", "3.2.S.2.5", "3.2.S.4.4"],
     "Labelling Change":         ["Module 1.3 (Administrative)"],
   };
- 
+
   const DP_sections = {
     "Process Change":           ["3.2.P.3.3", "3.2.P.3.4", "3.2.P.3.5", "3.2.P.5.4", "3.2.P.8.1"],
     "Site Transfer":            ["3.2.P.3.1", "3.2.P.3.3", "3.2.P.3.5", "GMP Certificate (3.2.R)"],
@@ -890,19 +889,19 @@ function getCTDSections(changeType, appliesTo) {
     "Scale-up / Scale-down":    ["3.2.P.3.3", "3.2.P.3.5", "3.2.P.5.4"],
     "Labelling Change":         ["Module 1.3 (Administrative)", "3.2.P.1"],
   };
- 
+
   const dsArr = DS_sections[changeType] || ["Module 3.2.S"];
   const dpArr = DP_sections[changeType] || ["Module 3.2.P"];
- 
+
   if (isDS)   return dsArr;
   if (isDP)   return dpArr;
   return [...new Set([...dsArr, ...dpArr])];
 }
- 
+
 // Recommendation generator
 function makeRecommendation(changeType, severity, productType, regions) {
   const regionList = regions.join(", ");
- 
+
   if (severity === "High") {
     return `This is a high-impact change requiring prior approval in most markets. Do not implement before receiving approval in all selected regions (${regionList}). Prepare a global comparability/validation package first and file sequentially — US and EU first, then follow-on markets. Consider ICH Q12 PACMP to streamline future changes of this type.`;
   }
@@ -911,11 +910,11 @@ function makeRecommendation(changeType, severity, productType, regions) {
   }
   return `This is a low-risk change. File or notify as required by each market (${regionList}). Retain supporting documentation in your change control system. No prior approval is expected, but ensure all records are inspection-ready.`;
 }
- 
+
 app.post("/analyze", analyzeLimiter, (req, res) => {
   try {
     const { input } = req.body;
- 
+
     // Input validation
     if (!input || typeof input !== "object") {
       return res.status(400).json({ error: "Invalid request: input object is required" });
@@ -924,20 +923,20 @@ app.post("/analyze", analyzeLimiter, (req, res) => {
     if (!changeType || typeof changeType !== "string") {
       return res.status(400).json({ error: "Invalid request: changeType is required" });
     }
- 
+
     const safeRegions  = Array.isArray(regions)  ? regions  : [];
     const safeFlags    = riskFlags && typeof riskFlags === "object" ? riskFlags : {};
- 
+
     const flags = {
       cqa:        !!safeFlags.cqa,
       impurity:   !!safeFlags.impurity,
       sterility:  !!safeFlags.sterility,
       validation: !!safeFlags.validation,
     };
- 
+
     const severity = calcSeverity(changeType, flags);
     const ctdSections = getCTDSections(changeType, appliesTo);
- 
+
     const regionResults = {};
     for (const region of safeRegions) {
       const entry = REGIONAL_MATRIX[region]?.[severity];
@@ -945,13 +944,13 @@ app.post("/analyze", analyzeLimiter, (req, res) => {
         regionResults[region] = { ...entry, risk: severity };
       }
     }
- 
+
     const riskNotes = [];
     if (flags.cqa)        riskNotes.push("CQA impact identified — comparability data required");
     if (flags.impurity)   riskNotes.push("Impurity profile change — ICH Q3A/Q3B justification needed");
     if (flags.sterility)  riskNotes.push("Sterility assurance impact — sterility validation data required");
     if (flags.validation) riskNotes.push("Process validation required — at least 3 conformance batches expected");
- 
+
     res.json({
       severity,
       productType,
@@ -967,11 +966,11 @@ app.post("/analyze", analyzeLimiter, (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
- 
- 
+
+
 // ── AI ANALYSIS — async job queue ────────────────────────────────────────────
 const aiLimiter = rateLimit({ windowMs: 60_000, max: 10, standardHeaders: true, legacyHeaders: false });
- 
+
 // Shared scoping rules + JSON schema used by both prompts.
 // `regions` is the exact list of markets the user selected — the model must never
 // stray outside it (this is what stops EMA/EU appearing when it wasn't selected).
@@ -985,7 +984,7 @@ function insightContract(regions, domain) {
 - Every guidance, risk, document, and strategy you give MUST be limited to these markets.
 - Do NOT mention, cite, compare to, or reference ANY market, agency, or regulatory framework that is not in that list. In particular do NOT mention EMA or EU variation categories (Type IA/IB/II) unless an EU or EMA market is explicitly in the list above.
 - "marketSpecific" MUST contain exactly one entry for each selected market and no others.${emaNote}
- 
+
 Respond with valid JSON only — no markdown, no prose outside the JSON — using this exact structure:
 {
   "applicableGuidances": [
@@ -1001,14 +1000,14 @@ Respond with valid JSON only — no markdown, no prose outside the JSON — usin
 }
 Provide 2 to 4 applicableGuidances. Be specific and technical — cite real guideline codes and clause numbers, not generic statements.`;
 }
- 
+
 function buildPharmaPrompt(assessResult) {
   const regions = assessResult.selectedRegions || [];
   const euSelected = regions.some(r => /EU|EMA|EEA/i.test(r));
   return `You are a senior regulatory affairs expert in pharmaceutical post-approval change management (ICH Q8-Q12, CTD/eCTD, and the specific post-approval change frameworks of the selected markets only).
- 
+
 A regulatory assessment has been run.
- 
+
 Assessment context:
 - Product type: ${assessResult.productType || "Pharmaceutical"}
 - Change: ${assessResult.title || assessResult.code || "Unknown change"}
@@ -1016,30 +1015,30 @@ Assessment context:
 - Condition: ${assessResult.subTypeDesc || ""}${euSelected ? `\n- EU variation type: ${assessResult.euType || ""}` : ""}
 - Severity: ${assessResult.severity || ""}
 - Selected markets: ${regions.join(", ")}
- 
+
 ${insightContract(regions, "pharma")}`;
 }
- 
+
 function buildMDPrompt(assessResult) {
   const regions = assessResult.selectedRegions || [];
   const filingsSummary = (assessResult.filings || [])
     .map(f => `${f.territory} (${f.agency}): ${f.action?.label} — ${f.action?.timeline}`)
     .join("\n");
- 
+
   return `You are a senior medical device regulatory consultant (ISO 13485, ISO 14971, IEC 62304, MDCG guidance, FDA 21 CFR Part 820 and 807, and the device frameworks of the selected markets only).
- 
+
 A device change assessment has been completed.
- 
+
 Assessment context:
 - Device class: ${assessResult.mdDeviceClass || ""}
 - Change type: ${assessResult.changeLabel || assessResult.mdChangeType || ""}
 - Selected markets: ${regions.join(", ")}
 - Filing requirements:
 ${filingsSummary}
- 
+
 ${insightContract(regions, "device")}`;
 }
- 
+
 app.post("/analyze/start", aiLimiter, requireAuth, async (req, res) => {
   // Expert Analysis is a Pro-only feature. Gate here so Free/Ad-Free accounts
   // can NEVER trigger an OpenAI call (no token cost), even via a direct API hit.
@@ -1054,14 +1053,14 @@ app.post("/analyze/start", aiLimiter, requireAuth, async (req, res) => {
     if (!assessResult || typeof assessResult !== "object") {
       return res.status(400).json({ error: "assessResult is required" });
     }
- 
+
     const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     aiJobs.set(jobId, { status: "pending" });
- 
+
     // Run AI generation asynchronously — don't await here
     const isMD = assessResult.productType === "Medical Device";
     const prompt = isMD ? buildMDPrompt(assessResult) : buildPharmaPrompt(assessResult);
- 
+
     (async () => {
       try {
         const completion = await openai.chat.completions.create({
@@ -1079,27 +1078,25 @@ app.post("/analyze/start", aiLimiter, requireAuth, async (req, res) => {
       // Clean up after 10 minutes
       setTimeout(() => aiJobs.delete(jobId), 10 * 60 * 1000);
     })();
- 
+
     res.json({ jobId });
   } catch (e) {
     console.error("[/analyze/start]", e);
     res.status(500).json({ error: "Internal server error" });
   }
 });
- 
+
 app.get("/analyze/status/:jobId", (req, res) => {
   const job = aiJobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ status: "not_found" });
   res.json(job);
 });
- 
- 
+
+
 // The Exchange (community forum) — additive routes under /exchange
 registerForumRoutes(app, { getDb, requireAuth });
- 
+
 const PORT = process.env.PORT || 5001;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("RegVerse backend running on port " + PORT);
 });
- 
-
