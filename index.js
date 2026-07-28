@@ -1092,6 +1092,76 @@ app.get("/analyze/status/:jobId", (req, res) => {
   res.json(job);
 });
 
+// ── PLAN A SUBMISSION — grounded-AI Pro "Expert Analysis" ─────────────
+// Additive; reuses the same aiJobs store, Pro gate, OpenAI client and limiter
+// as /analyze. The model is GROUNDED on the verified free-tier plan it is sent
+// (it must expand, not invent) so pathways/timelines stay accurate.
+function buildPlanSubmissionPrompt(plan) {
+  return `You are a senior regulatory-affairs strategist. Using ONLY the VERIFIED FACTS below as your factual anchor, produce an EXHAUSTIVE, practitioner-grade submission plan.
+
+STRICT RULES:
+- Do NOT invent or change any pathway name, legal basis, or review timeline — use exactly what appears in VERIFIED FACTS. If a specific figure/fee/date is not provided, describe it generically and state it must be confirmed against the official source. Never fabricate numbers.
+- Expand each market into a full CTD/eCTD dossier index (Module 1 regional, Module 2 summaries, Module 3 quality, Module 4 nonclinical, Module 5 clinical) with the granular sub-items a real dossier needs for THIS product type.
+- Add a concise cross-market strategy: filing sequence (use any reliance shortcut provided), key risks, and recommended agency meetings.
+
+VERIFIED FACTS (ground truth — do not contradict):
+${JSON.stringify(plan, null, 2)}
+
+Return a JSON object EXACTLY of this shape:
+{
+  "summary": "2-3 sentence overview",
+  "markets": [
+    { "market": "US", "pathway": "string from the facts", "modules": [ { "title": "Module 1 — Administrative & Regional", "items": ["...","..."] } ], "note": "one-line reminder to verify against the cited official source" }
+  ],
+  "sequencing": "recommended filing order & reliance strategy",
+  "risks": ["...","..."],
+  "disclaimer": "AI-assisted, grounded on verified facts. Verify against official sources before acting. Not regulatory advice."
+}`;
+}
+
+app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
+  if (!isProUser(req.user)) {
+    return res.status(403).json({ error: "Expert Analysis is a Pro feature.", code: "pro_required" });
+  }
+  if (!openai) {
+    return res.status(503).json({ error: "AI analysis not configured — OpenAI API key missing" });
+  }
+  try {
+    const { plan } = req.body;
+    if (!plan || typeof plan !== "object" || !Array.isArray(plan.cards)) {
+      return res.status(400).json({ error: "plan is required" });
+    }
+    const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    aiJobs.set(jobId, { status: "pending" });
+    const prompt = buildPlanSubmissionPrompt(plan);
+    (async () => {
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" },
+        });
+        const parsed = JSON.parse(completion.choices[0].message.content.trim());
+        aiJobs.set(jobId, { status: "done", result: parsed });
+      } catch (e) {
+        console.error("[plan-submission AI job error]", e.message);
+        aiJobs.set(jobId, { status: "error", error: e.message });
+      }
+      setTimeout(() => aiJobs.delete(jobId), 10 * 60 * 1000);
+    })();
+    res.json({ jobId });
+  } catch (e) {
+    console.error("[/plan-submission/start]", e);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/plan-submission/status/:jobId", (req, res) => {
+  const job = aiJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ status: "not_found" });
+  res.json(job);
+});
+
 
 // The Exchange (community forum) — additive routes under /exchange
 registerForumRoutes(app, { getDb, requireAuth });
