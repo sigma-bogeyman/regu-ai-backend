@@ -1097,21 +1097,33 @@ app.get("/analyze/status/:jobId", (req, res) => {
 // as /analyze. The model is GROUNDED on the verified free-tier plan it is sent
 // (it must expand, not invent) so pathways/timelines stay accurate.
 function buildPlanSubmissionPrompt(plan) {
-  return `You are a senior regulatory-affairs strategist. Using ONLY the VERIFIED FACTS below as your factual anchor, produce an EXHAUSTIVE, practitioner-grade submission plan.
+  return `You are a senior regulatory-affairs strategist writing a detailed, practitioner-grade global submission plan. Use ONLY the VERIFIED FACTS below as your factual anchor.
 
-STRICT RULES:
-- Do NOT invent or change any pathway name, legal basis, or review timeline — use exactly what appears in VERIFIED FACTS. If a specific figure/fee/date is not provided, describe it generically and state it must be confirmed against the official source. Never fabricate numbers.
-- Expand each market into a full CTD/eCTD dossier index (Module 1 regional, Module 2 summaries, Module 3 quality, Module 4 nonclinical, Module 5 clinical) with the granular sub-items a real dossier needs for THIS product type.
-- Add a concise cross-market strategy: filing sequence (use any reliance shortcut provided), key risks, and recommended agency meetings.
+DEPTH REQUIREMENTS — this must be GRANULAR, specific and useful to an experienced RA professional, never generic:
+- For EVERY market, expand ALL FIVE CTD modules (M1 Administrative/Regional, M2 Summaries, M3 Quality/CMC, M4 Nonclinical, M5 Clinical). For each module give 4–8 SPECIFIC, product-appropriate sub-items — the actual documents, studies, analyses and datasets required for THIS exact product type, and where relevant the acceptance expectation (e.g. "comparative PK study powered for the pre-specified equivalence margin"; "analytical similarity assessed across Tier 1 equivalence testing").
+- For EVERY market also provide:
+  - "considerations": 3–5 strategic/technical points specific to this product AND market (e.g. reference-product selection, bridging strategy, immunogenicity plan, container/device, choice of reference member state, expedited-pathway eligibility).
+  - "pitfalls": 2–4 common deficiencies that reviewers actually raise for this product type in this market.
+- Cross-market: a concrete "sequencing" strategy (use any reliance shortcut provided) and a "risks" list of the top programme-level risks.
+
+GROUNDING RULES (critical — accuracy over completeness):
+- Do NOT invent or change any pathway name, legal basis or review timeline — use EXACTLY what appears in VERIFIED FACTS. Never fabricate specific figures, fees or dates; if a number is not provided, state it must be confirmed against the official source.
 
 VERIFIED FACTS (ground truth — do not contradict):
 ${JSON.stringify(plan, null, 2)}
 
 Return a JSON object EXACTLY of this shape:
 {
-  "summary": "2-3 sentence overview",
+  "summary": "3-4 sentence strategic overview",
   "markets": [
-    { "market": "US", "pathway": "string from the facts", "modules": [ { "title": "Module 1 — Administrative & Regional", "items": ["...","..."] } ], "note": "one-line reminder to verify against the cited official source" }
+    {
+      "market": "US",
+      "pathway": "string taken from the facts",
+      "modules": [ { "title": "Module 3 — Quality (CMC)", "items": ["specific item 1","specific item 2","..."] } ],
+      "considerations": ["...","..."],
+      "pitfalls": ["...","..."],
+      "note": "one-line reminder to verify against the official source"
+    }
   ],
   "sequencing": "recommended filing order & reliance strategy",
   "risks": ["...","..."],
@@ -1137,7 +1149,7 @@ app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
     (async () => {
       try {
         const completion = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
+          model: "gpt-4o", // deeper/granular for the Pro plan (Assess-a-Change still uses gpt-4o-mini)
           messages: [{ role: "user", content: prompt }],
           response_format: { type: "json_object" },
         });
