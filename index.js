@@ -1096,39 +1096,66 @@ app.get("/analyze/status/:jobId", (req, res) => {
 // Additive; reuses the same aiJobs store, Pro gate, OpenAI client and limiter
 // as /analyze. The model is GROUNDED on the verified free-tier plan it is sent
 // (it must expand, not invent) so pathways/timelines stay accurate.
-function buildPlanSubmissionPrompt(plan) {
-  return `You are a senior regulatory-affairs strategist writing a detailed, practitioner-grade global submission plan. Use ONLY the VERIFIED FACTS below as your factual anchor.
+function buildPlanSubmissionPrompt(plan, context) {
+  const ctx = context || {};
+  const assets = (ctx.dataOnHand && ctx.dataOnHand.length) ? ctx.dataOnHand.join(", ") : "not specified";
+  return `You are a senior regulatory-affairs strategist producing a BESPOKE, enterprise-grade global submission strategy for a SPECIFIC product. Ground every fact on the VERIFIED FACTS; expand and tailor, never invent pathway names, legal bases, timelines, fees or dates.
 
-DEPTH REQUIREMENTS — this must be GRANULAR, specific and useful to an experienced RA professional, never generic:
-- For EVERY market, expand ALL FIVE CTD modules (M1 Administrative/Regional, M2 Summaries, M3 Quality/CMC, M4 Nonclinical, M5 Clinical). For each module give 4–8 SPECIFIC, product-appropriate sub-items — the actual documents, studies, analyses and datasets required for THIS exact product type, and where relevant the acceptance expectation (e.g. "comparative PK study powered for the pre-specified equivalence margin"; "analytical similarity assessed across Tier 1 equivalence testing").
-- For EVERY market also provide:
-  - "considerations": 3–5 strategic/technical points specific to this product AND market (e.g. reference-product selection, bridging strategy, immunogenicity plan, container/device, choice of reference member state, expedited-pathway eligibility).
-  - "pitfalls": 2–4 common deficiencies that reviewers actually raise for this product type in this market.
-- Cross-market: a concrete "sequencing" strategy (use any reliance shortcut provided) and a "risks" list of the top programme-level risks.
+PRODUCT CONTEXT (tailor everything to this exact product):
+- Product type: ${ctx.productLabel || ctx.productType || "n/a"}
+- Active substance status: ${ctx.activeStatus || "n/a"}
+- Dosage form / route: ${ctx.dosageForm || "n/a"}
+- Therapeutic area: ${ctx.therapeuticArea || "n/a"}${ctx.serious ? " (serious / rare — orphan & expedited routes in scope)" : ""}
+- Development stage: ${ctx.devStage || "n/a"}
+- Assets already in hand: ${assets}
 
-GROUNDING RULES (critical — accuracy over completeness):
-- Do NOT invent or change any pathway name, legal basis or review timeline — use EXACTLY what appears in VERIFIED FACTS. Never fabricate specific figures, fees or dates; if a number is not provided, state it must be confirmed against the official source.
+TASKS (all must be specific to the product above, never generic):
+1. GAP ANALYSIS — from the assets in hand and the dev stage: what the applicant HAS (confirm), what is MISSING on the critical path to filing, and what to PRIORITISE starting now.
+2. GLOBAL SEQUENCE — recommended filing order across the target markets, using any reliance shortcut in the facts; give a short narrative AND per-market "lanes" (relative start, rough duration, one-line note) so it can be drawn as a timeline.
+3. PER-MARKET DEPTH — for each market expand ALL FIVE CTD modules (M1–M5) with 4–8 specific, product-appropriate sub-items; plus 3–5 "considerations" and 2–4 "pitfalls" reviewers actually raise for THIS product type in THIS market.
+4. RISKS — top programme-level risks.
+
+GROUNDING (accuracy over completeness): use EXACTLY the pathway names, legal bases and timelines from VERIFIED FACTS. Never fabricate fees, figures or dates; if unknown, say to confirm against the official source.
 
 VERIFIED FACTS (ground truth — do not contradict):
 ${JSON.stringify(plan, null, 2)}
 
 Return a JSON object EXACTLY of this shape:
 {
-  "summary": "3-4 sentence strategic overview",
-  "markets": [
-    {
-      "market": "US",
-      "pathway": "string taken from the facts",
-      "modules": [ { "title": "Module 3 — Quality (CMC)", "items": ["specific item 1","specific item 2","..."] } ],
-      "considerations": ["...","..."],
-      "pitfalls": ["...","..."],
-      "note": "one-line reminder to verify against the official source"
-    }
-  ],
-  "sequencing": "recommended filing order & reliance strategy",
+  "summary": "3-4 sentence strategic overview tailored to the product",
+  "timeToApproval": "rough estimate to first approval (qualitative if unsure, e.g. '~3–4 years from now')",
+  "gapAnalysis": { "have": ["..."], "missing": ["...critical-path items still owed..."], "prioritise": ["...what to start now..."] },
+  "sequence": { "narrative": "recommended order & reliance rationale", "lanes": [ { "market": "EU", "start": "Month 0", "duration": "~14 mo", "note": "file first" } ] },
+  "markets": [ { "market": "US", "pathway": "string taken from the facts", "modules": [ { "title": "Module 3 — Quality (CMC)", "items": ["specific item 1","..."] } ], "considerations": ["...","..."], "pitfalls": ["...","..."], "note": "verify against the official source" } ],
   "risks": ["...","..."],
   "disclaimer": "AI-assisted, grounded on verified facts. Verify against official sources before acting. Not regulatory advice."
 }`;
+}
+
+// Precedent / competitive intelligence — grounded via web search when available,
+// falling back to model knowledge. Deliberately HIGH-LEVEL (pathway patterns,
+// general review timing) and always labelled for verification — never invents
+// specific product names, exact dates or precise review times.
+async function fetchPlanPrecedent(context, plan) {
+  const ctx = context || {};
+  const markets = (plan.cards || []).map((c) => c.market).join(", ") || "US, EU, UK";
+  const q = `High-level regulatory precedent for a ${ctx.productLabel || ctx.productType || "medicinal product"} in ${ctx.therapeuticArea || "its therapeutic area"} for markets: ${markets}. Give 3-5 HIGH-LEVEL patterns only: the approval pathway types typically used in this class, general review timing, and whether expedited/conditional routes or single-arm pivotal designs have been accepted. Do NOT name specific products or invent exact dates/review times. One sentence each.`;
+  try {
+    const r = await openai.responses.create({ model: "gpt-4o", tools: [{ type: "web_search_preview" }], input: q + " Return ONLY a JSON array of strings." });
+    const text = (r.output_text || "").trim();
+    const arr = JSON.parse(text.slice(text.indexOf("["), text.lastIndexOf("]") + 1));
+    if (Array.isArray(arr) && arr.length) return { label: "AI-suggested — verify before relying", grounded: true, items: arr.slice(0, 6) };
+  } catch (e) {
+    console.error("[precedent web-search unavailable, falling back]", e.message);
+  }
+  try {
+    const c = await openai.chat.completions.create({ model: "gpt-4o", messages: [{ role: "user", content: q + ' Return JSON: {"items":["...","..."]}' }], response_format: { type: "json_object" } });
+    const parsed = JSON.parse(c.choices[0].message.content.trim());
+    return { label: "AI-suggested — verify before relying", grounded: false, items: (parsed.items || []).slice(0, 6) };
+  } catch (e) {
+    console.error("[precedent fallback error]", e.message);
+    return null;
+  }
 }
 
 app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
@@ -1139,13 +1166,13 @@ app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
     return res.status(503).json({ error: "AI analysis not configured — OpenAI API key missing" });
   }
   try {
-    const { plan } = req.body;
+    const { plan, context } = req.body;
     if (!plan || typeof plan !== "object" || !Array.isArray(plan.cards)) {
       return res.status(400).json({ error: "plan is required" });
     }
     const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     aiJobs.set(jobId, { status: "pending" });
-    const prompt = buildPlanSubmissionPrompt(plan);
+    const prompt = buildPlanSubmissionPrompt(plan, context);
     (async () => {
       try {
         const completion = await openai.chat.completions.create({
@@ -1154,6 +1181,8 @@ app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
           response_format: { type: "json_object" },
         });
         const parsed = JSON.parse(completion.choices[0].message.content.trim());
+        // Add high-level, verify-first precedent (web-search grounded when available)
+        try { parsed.precedent = await fetchPlanPrecedent(context, plan); } catch { parsed.precedent = null; }
         aiJobs.set(jobId, { status: "done", result: parsed });
       } catch (e) {
         console.error("[plan-submission AI job error]", e.message);
