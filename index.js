@@ -441,8 +441,8 @@ const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
 // Server-side source of truth for prices (in paise). Never trust an amount sent
 // by the browser — the plan key is all the client gets to choose.
 const RZP_PLANS = {
-  adfree: { amount: 19900, plan: "adfree" }, // ₹199.00
-  pro:    { amount: 34900, plan: "pro" },    // ₹349.00
+  adfree: { amount: 29900, plan: "adfree" }, // ₹199.00
+  pro:    { amount: 54900, plan: "pro" },    // ₹349.00
 };
 
 // 1) Create an order for the chosen plan.
