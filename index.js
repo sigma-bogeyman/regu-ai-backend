@@ -248,6 +248,59 @@ app.get("/auth/me", requireAuth, (req, res) => {
   res.json(publicUser(req.user));
 });
 
+// ── APP CONFIG / FORCED UPDATE GATE ────────────────────────
+// minVersionCode is stored in the DB (config collection, _id "app") and edited
+// from the in-app Admin panel — no Railway/redeploy needed. Any Android build
+// whose versionCode is below it shows a blocking "Update required" screen.
+// Set to 0 to turn the gate off. PLAY_STORE_URL may be overridden via env.
+const PLAY_STORE_URL = process.env.PLAY_STORE_URL
+  || "https://play.google.com/store/apps/details?id=com.regverse.app";
+
+// Read the saved minimum from the config collection (defaults to 0 = gate off).
+async function getMinVersionCode() {
+  try {
+    const db = await getDb();
+    const doc = await db.collection("config").findOne({ _id: "app" });
+    return parseInt(String(doc?.minVersionCode ?? 0), 10) || 0;
+  } catch {
+    return 0; // fail open — never block the app if the DB is unreachable
+  }
+}
+
+// Public (no auth) so the update wall can gate every user, even signed-out.
+app.get("/app-config", async (req, res) => {
+  const current = parseInt(String(req.query.versionCode || "0"), 10) || 0;
+  const minVersionCode = await getMinVersionCode();
+  res.json({
+    minVersionCode,
+    updateRequired: current > 0 && current < minVersionCode,
+    storeUrl: PLAY_STORE_URL,
+  });
+});
+
+// Admin-only: save the minimum version code. Guarded by the admin allow-list.
+app.post("/admin/app-config", requireAuth, async (req, res) => {
+  if (!ADMIN_EMAILS.includes((req.user.email || "").toLowerCase())) {
+    return res.status(403).json({ error: "Admins only." });
+  }
+  const n = parseInt(String(req.body?.minVersionCode), 10);
+  if (!Number.isFinite(n) || n < 0 || n > 100000) {
+    return res.status(400).json({ error: "minVersionCode must be a number between 0 and 100000." });
+  }
+  try {
+    const db = await getDb();
+    await db.collection("config").updateOne(
+      { _id: "app" },
+      { $set: { minVersionCode: n, updatedAt: new Date() } },
+      { upsert: true },
+    );
+    res.json({ ok: true, minVersionCode: n });
+  } catch (e) {
+    console.error("[/admin/app-config]", e);
+    res.status(500).json({ error: "Could not save. Try again." });
+  }
+});
+
 // ── SAVED ASSESSMENTS ──────────────────────────────────────
 app.get("/assessments", requireAuth, async (req, res) => {
   try {
@@ -441,8 +494,8 @@ const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
 // Server-side source of truth for prices (in paise). Never trust an amount sent
 // by the browser — the plan key is all the client gets to choose.
 const RZP_PLANS = {
-  adfree: { amount: 29900, plan: "adfree" }, // ₹199.00
-  pro:    { amount: 54900, plan: "pro" },    // ₹349.00
+  adfree: { amount: 19900, plan: "adfree" }, // ₹199.00
+  pro:    { amount: 34900, plan: "pro" },    // ₹349.00
 };
 
 // 1) Create an order for the chosen plan.
@@ -1099,9 +1152,10 @@ app.get("/analyze/status/:jobId", (req, res) => {
 function buildPlanSubmissionPrompt(plan, context) {
   const ctx = context || {};
   const assets = (ctx.dataOnHand && ctx.dataOnHand.length) ? ctx.dataOnHand.join(", ") : "not specified";
-  return `You are a senior regulatory-affairs strategist producing a BESPOKE, enterprise-grade global submission strategy for a SPECIFIC product. Ground every fact on the VERIFIED FACTS; expand and tailor, never invent pathway names, legal bases, timelines, fees or dates.
+  const blueprints = Array.isArray(ctx.blueprints) && ctx.blueprints.length ? ctx.blueprints : null;
+  return `You are a senior regulatory-affairs strategist (20+ years) producing a BESPOKE, EXHAUSTIVE, enterprise-grade global submission strategy for a SPECIFIC product. This is a paid "Expert Analysis" — it must be visibly deeper and more tailored than a generic checklist. Ground everything on the VERIFIED FACTS and VERIFIED CTD BLUEPRINTS; EXPAND and TAILOR them — never invent or contradict any pathway name, legal basis, timeline, fee or date.
 
-PRODUCT CONTEXT (tailor everything to this exact product):
+PRODUCT CONTEXT (tailor every line to this exact product — reference the molecule type, indication and stage explicitly):
 - Product type: ${ctx.productLabel || ctx.productType || "n/a"}
 - Active substance status: ${ctx.activeStatus || "n/a"}
 - Dosage form / route: ${ctx.dosageForm || "n/a"}
@@ -1109,25 +1163,26 @@ PRODUCT CONTEXT (tailor everything to this exact product):
 - Development stage: ${ctx.devStage || "n/a"}
 - Assets already in hand: ${assets}
 
-TASKS (all must be specific to the product above, never generic):
-1. GAP ANALYSIS — from the assets in hand and the dev stage: what the applicant HAS (confirm), what is MISSING on the critical path to filing, and what to PRIORITISE starting now.
-2. GLOBAL SEQUENCE — recommended filing order across the target markets, using any reliance shortcut in the facts; give a short narrative AND per-market "lanes" (relative start, rough duration, one-line note) so it can be drawn as a timeline.
-3. PER-MARKET DEPTH — for each market expand ALL FIVE CTD modules (M1–M5) with 4–8 specific, product-appropriate sub-items; plus 3–5 "considerations" and 2–4 "pitfalls" reviewers actually raise for THIS product type in THIS market.
-4. RISKS — top programme-level risks.
+DEPTH BAR (this depth IS the paid value — never be generic or brief):
+1. GAP ANALYSIS — cross-reference the assets in hand and the dev stage against what each pathway actually requires. "have" = confirm what's covered; "missing" = the SPECIFIC critical-path deliverables still owed, each tied to its CTD location/study with a rough sense of effort or lead-time; "prioritise" = what to start NOW and why.
+2. GLOBAL SEQUENCE — a concrete filing order across the target markets, using any reliance shortcut in the facts. Give a narrative AND per-market "lanes" (relative start, rough duration, one-line rationale) so it renders as a timeline.
+3. PER-MARKET DEPTH — for EVERY market, expand ALL FIVE CTD modules (M1–M5). For each module give 6–10 SPECIFIC, product-appropriate sub-items — the actual documents, studies, analyses, datasets and acceptance expectations for THIS exact product type (e.g. biosimilar: tiered analytical similarity, orthogonal functional assays, comparative PK/PD design & equivalence margin, immunogenicity sampling; generic: BE design with the 80.00–125.00% CI or the BCS biowaiver basis; biologic: potency bioassay, viral clearance, comparability protocol). Build ON the blueprint clauses provided — make them richer and product-specific, never thinner. Also give 4–6 product-specific "considerations" and 3–5 "pitfalls" reviewers ACTUALLY raise for this product type in this market.
+4. RISKS — 5–8 programme-level risks; write each as "risk — why it happens — how to mitigate" in one sentence.
 
-GROUNDING (accuracy over completeness): use EXACTLY the pathway names, legal bases and timelines from VERIFIED FACTS. Never fabricate fees, figures or dates; if unknown, say to confirm against the official source.
+GROUNDING (accuracy over completeness): use EXACTLY the pathway names, legal bases and timelines from the VERIFIED FACTS/BLUEPRINTS. Never fabricate fees, figures or dates; where a number isn't provided, say to confirm it against the official source.
 
 VERIFIED FACTS (ground truth — do not contradict):
 ${JSON.stringify(plan, null, 2)}
+${blueprints ? `\nVERIFIED CTD BLUEPRINTS (authoritative per-market dossier facts to EXPAND from — never contradict the clauses/codes here):\n${JSON.stringify(blueprints, null, 2)}` : ""}
 
-Return a JSON object EXACTLY of this shape:
+Return a JSON object EXACTLY of this shape (be exhaustive within it; output MUST be valid, complete JSON):
 {
-  "summary": "3-4 sentence strategic overview tailored to the product",
-  "timeToApproval": "rough estimate to first approval (qualitative if unsure, e.g. '~3–4 years from now')",
-  "gapAnalysis": { "have": ["..."], "missing": ["...critical-path items still owed..."], "prioritise": ["...what to start now..."] },
+  "summary": "4-5 sentence strategic overview naming the product type, indication and the crux of the strategy",
+  "timeToApproval": "rough estimate to first approval (qualitative if unsure)",
+  "gapAnalysis": { "have": ["..."], "missing": ["specific deliverable — CTD location — rough effort"], "prioritise": ["..."] },
   "sequence": { "narrative": "recommended order & reliance rationale", "lanes": [ { "market": "EU", "start": "Month 0", "duration": "~14 mo", "note": "file first" } ] },
-  "markets": [ { "market": "US", "pathway": "string taken from the facts", "modules": [ { "title": "Module 3 — Quality (CMC)", "items": ["specific item 1","..."] } ], "considerations": ["...","..."], "pitfalls": ["...","..."], "note": "verify against the official source" } ],
-  "risks": ["...","..."],
+  "markets": [ { "market": "US", "pathway": "string taken from the facts", "modules": [ { "title": "Module 3 — Quality (CMC)", "items": ["...6-10 specific items..."] } ], "considerations": ["...4-6..."], "pitfalls": ["...3-5..."], "note": "verify against the official source" } ],
+  "risks": ["risk — why — mitigation", "..."],
   "disclaimer": "AI-assisted, grounded on verified facts. Verify against official sources before acting. Not regulatory advice."
 }`;
 }
@@ -1179,6 +1234,7 @@ app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
           model: "gpt-4o", // deeper/granular for the Pro plan (Assess-a-Change still uses gpt-4o-mini)
           messages: [{ role: "user", content: prompt }],
           response_format: { type: "json_object" },
+          max_tokens: 8000, // allow the exhaustive multi-market JSON to complete without truncation
         });
         const parsed = JSON.parse(completion.choices[0].message.content.trim());
         // Add high-level, verify-first precedent (web-search grounded when available)
