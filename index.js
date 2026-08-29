@@ -191,6 +191,11 @@ async function requireAuth(req, res, next) {
     const user = await db.collection("users").findOne({ _id: new ObjectId(payload.uid) });
     if (!user) return res.status(401).json({ error: "Account not found" });
     req.user = user;
+    // Stamp lastSeen for DAU/WAU stats — throttled to once/hour per user to avoid write storms.
+    const hourAgo = new Date(Date.now() - 3600_000);
+    if (!user.lastSeen || new Date(user.lastSeen) < hourAgo) {
+      db.collection("users").updateOne({ _id: user._id }, { $set: { lastSeen: new Date() } }).catch(() => {});
+    }
     next();
   } catch (e) {
     return res.status(401).json({ error: "Invalid or expired session" });
@@ -256,48 +261,138 @@ app.get("/auth/me", requireAuth, (req, res) => {
 const PLAY_STORE_URL = process.env.PLAY_STORE_URL
   || "https://play.google.com/store/apps/details?id=com.regverse.app";
 
-// Read the saved minimum from the config collection (defaults to 0 = gate off).
-async function getMinVersionCode() {
+// Read the whole app-config doc (defaults to {} if missing/unreachable — fail open).
+async function getConfig() {
   try {
     const db = await getDb();
-    const doc = await db.collection("config").findOne({ _id: "app" });
-    return parseInt(String(doc?.minVersionCode ?? 0), 10) || 0;
+    return (await db.collection("config").findOne({ _id: "app" })) || {};
   } catch {
-    return 0; // fail open — never block the app if the DB is unreachable
+    return {};
   }
 }
 
-// Public (no auth) so the update wall can gate every user, even signed-out.
+const isAdminReq = (req) => ADMIN_EMAILS.includes((req.user?.email || "").toLowerCase());
+
+// Fire-and-forget log of an AI run, for the admin usage charts.
+function logAiEvent(type, userId) {
+  getDb()
+    .then(db => db.collection("ai_events").insertOne({ type, userId: String(userId || ""), at: new Date() }))
+    .catch(() => {});
+}
+
+// Bucket a list of dates into per-day counts for the last `days` days (oldest→newest).
+function bucketDaily(dates, days) {
+  const out = new Array(days).fill(0);
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const startMs = midnight.getTime() - (days - 1) * 86400_000;
+  for (const dt of dates) {
+    const idx = Math.floor((new Date(dt).getTime() - startMs) / 86400_000);
+    if (idx >= 0 && idx < days) out[idx]++;
+  }
+  return out;
+}
+
+// Public (no auth) so the app can gate/announce for every user, even signed-out.
 app.get("/app-config", async (req, res) => {
   const current = parseInt(String(req.query.versionCode || "0"), 10) || 0;
-  const minVersionCode = await getMinVersionCode();
+  const cfg = await getConfig();
+  const minVersionCode = parseInt(String(cfg.minVersionCode ?? 0), 10) || 0;
+  const b = cfg.broadcast || {};
+  const m = cfg.maintenance || {};
   res.json({
     minVersionCode,
     updateRequired: current > 0 && current < minVersionCode,
     storeUrl: PLAY_STORE_URL,
+    broadcast: { active: !!b.active, message: String(b.message || ""), id: String(b.id || "") },
+    maintenance: { active: !!m.active, message: String(m.message || "") },
   });
 });
 
-// Admin-only: save the minimum version code. Guarded by the admin allow-list.
+// Admin-only: save any of minVersionCode / broadcast / maintenance (partial updates).
 app.post("/admin/app-config", requireAuth, async (req, res) => {
-  if (!ADMIN_EMAILS.includes((req.user.email || "").toLowerCase())) {
-    return res.status(403).json({ error: "Admins only." });
-  }
-  const n = parseInt(String(req.body?.minVersionCode), 10);
-  if (!Number.isFinite(n) || n < 0 || n > 100000) {
-    return res.status(400).json({ error: "minVersionCode must be a number between 0 and 100000." });
-  }
+  if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+  const set = { updatedAt: new Date() };
   try {
+    if (req.body?.minVersionCode !== undefined) {
+      const n = parseInt(String(req.body.minVersionCode), 10);
+      if (!Number.isFinite(n) || n < 0 || n > 100000) {
+        return res.status(400).json({ error: "minVersionCode must be a number between 0 and 100000." });
+      }
+      set.minVersionCode = n;
+    }
+    if (req.body?.broadcast !== undefined) {
+      const b = req.body.broadcast || {};
+      set.broadcast = { active: !!b.active, message: String(b.message || "").slice(0, 300), id: String(Date.now()) };
+    }
+    if (req.body?.maintenance !== undefined) {
+      const m = req.body.maintenance || {};
+      set.maintenance = { active: !!m.active, message: String(m.message || "").slice(0, 300) };
+    }
     const db = await getDb();
-    await db.collection("config").updateOne(
-      { _id: "app" },
-      { $set: { minVersionCode: n, updatedAt: new Date() } },
-      { upsert: true },
-    );
-    res.json({ ok: true, minVersionCode: n });
+    await db.collection("config").updateOne({ _id: "app" }, { $set: set }, { upsert: true });
+    const cfg = await getConfig();
+    res.json({ ok: true, minVersionCode: parseInt(String(cfg.minVersionCode ?? 0), 10) || 0, broadcast: cfg.broadcast || null, maintenance: cfg.maintenance || null });
   } catch (e) {
     console.error("[/admin/app-config]", e);
     res.status(500).json({ error: "Could not save. Try again." });
+  }
+});
+
+// Admin-only: dashboard stats. Read-only counts + 14-day trends.
+app.get("/admin/stats", requireAuth, async (req, res) => {
+  if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+  try {
+    const db = await getDb();
+    const users = db.collection("users");
+    const now = Date.now();
+    const ago = (days) => new Date(now - days * 86400_000);
+
+    const [total, new7, new30, dau, wau] = await Promise.all([
+      users.countDocuments({}),
+      users.countDocuments({ createdAt: { $gte: ago(7) } }),
+      users.countDocuments({ createdAt: { $gte: ago(30) } }),
+      users.countDocuments({ lastSeen: { $gte: ago(1) } }),
+      users.countDocuments({ lastSeen: { $gte: ago(7) } }),
+    ]);
+
+    const planAgg = await users.aggregate([{ $group: { _id: "$plan", c: { $sum: 1 } } }]).toArray();
+    let pro = 0, adfree = 0, free = 0;
+    for (const p of planAgg) {
+      const k = p._id || "free";
+      if (k === "pro" || k === "premium") pro += p.c;
+      else if (k === "adfree") adfree += p.c;
+      else free += p.c;
+    }
+
+    const since14 = ago(14);
+    const signupDocs = await users.find({ createdAt: { $gte: since14 } }, { projection: { createdAt: 1 } }).toArray();
+    const dailySignups = bucketDaily(signupDocs.map(x => x.createdAt), 14);
+
+    const aiDocs = await db.collection("ai_events").find({ at: { $gte: since14 } }, { projection: { type: 1, at: 1 } }).toArray();
+    const dailyAssess = bucketDaily(aiDocs.filter(x => x.type === "assess").map(x => x.at), 14);
+    const dailyPlan = bucketDaily(aiDocs.filter(x => x.type === "plan").map(x => x.at), 14);
+    const aiTotal7 = aiDocs.filter(x => new Date(x.at) >= ago(7)).length;
+
+    const [assessments, threads, replies] = await Promise.all([
+      db.collection("assessments").countDocuments({}).catch(() => 0),
+      db.collection("forum_threads").countDocuments({}).catch(() => 0),
+      db.collection("forum_replies").countDocuments({}).catch(() => 0),
+    ]);
+
+    const recent = await users.find({}, { projection: { email: 1, createdAt: 1, plan: 1 } }).sort({ createdAt: -1 }).limit(8).toArray();
+    const recentSignups = recent.map(u => ({ email: u.email, createdAt: u.createdAt, plan: u.plan || "free" }));
+
+    res.json({
+      health: { ok: true, uptimeSec: Math.round(process.uptime()), dbConnected: true, serverTime: new Date().toISOString() },
+      users: { total, new7, new30, dau, wau, byPlan: { pro, adfree, free }, dailySignups },
+      ai: { total7: aiTotal7, dailyAssess, dailyPlan },
+      content: { assessments, threads, replies },
+      revenueAnnual: pro * 549 + adfree * 299,
+      recentSignups,
+    });
+  } catch (e) {
+    console.error("[/admin/stats]", e);
+    res.status(500).json({ error: "Could not load stats." });
   }
 });
 
@@ -1109,6 +1204,7 @@ app.post("/analyze/start", aiLimiter, requireAuth, async (req, res) => {
 
     const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     aiJobs.set(jobId, { status: "pending" });
+    logAiEvent("assess", req.user._id);
 
     // Run AI generation asynchronously — don't await here
     const isMD = assessResult.productType === "Medical Device";
@@ -1227,6 +1323,7 @@ app.post("/plan-submission/start", aiLimiter, requireAuth, async (req, res) => {
     }
     const jobId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     aiJobs.set(jobId, { status: "pending" });
+    logAiEvent("plan", req.user._id);
     const prompt = buildPlanSubmissionPrompt(plan, context);
     (async () => {
       try {
