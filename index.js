@@ -138,7 +138,6 @@ function escapeHtml(s) {
 
 // ── GOOGLE PLAY BILLING verification (server-side) ─────────
 const ANDROID_PACKAGE     = process.env.ANDROID_PACKAGE_NAME || "com.regverse.app";
-const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
 // Robustly normalise the service-account private key however Railway stored it:
 // strip wrapping quotes, turn literal \n into real newlines, and if it's not a
 // PEM (no BEGIN header) try base64-decoding it. Fixes the "secretOrPrivateKey
@@ -157,7 +156,14 @@ function loadPrivateKey(raw) {
   }
   return k;
 }
-const GOOGLE_PRIVATE_KEY = loadPrivateKey(process.env.GOOGLE_PRIVATE_KEY);
+// Preferred (mangle-proof): paste the ENTIRE service-account .json file into the
+// Railway var GOOGLE_SERVICE_ACCOUNT_JSON. JSON.parse restores the newlines exactly.
+// Falls back to the older split GOOGLE_CLIENT_EMAIL / GOOGLE_PRIVATE_KEY vars.
+let _SA = {};
+try { if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) _SA = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON); }
+catch (e) { console.error("[GOOGLE_SERVICE_ACCOUNT_JSON] parse failed:", e.message); }
+const GOOGLE_CLIENT_EMAIL = _SA.client_email || process.env.GOOGLE_CLIENT_EMAIL || "";
+const GOOGLE_PRIVATE_KEY = loadPrivateKey(_SA.private_key || process.env.GOOGLE_PRIVATE_KEY);
 
 // GA4 property (numeric, e.g. 15526298983) — set in Railway to enable the Web-traffic panel.
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID || "";
