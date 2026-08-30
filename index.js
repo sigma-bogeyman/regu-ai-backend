@@ -31,6 +31,16 @@ app.use(cors({
 }));
 app.use(express.json());
 
+// Baseline security headers (no extra dependency needed).
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+  next();
+});
+
 // Brute-force protection on credential endpoints. Defined here (before the auth
 // routes below) so it is initialised by the time those routes are registered.
 // 10 attempts per IP per 15 min covers honest typos but stops password spraying
@@ -45,6 +55,12 @@ const authLimiter = rateLimit({
 
 // ── AUTH: Mongo connection, JWT helpers, middleware ────────
 const JWT_SECRET = process.env.JWT_SECRET || "dev-insecure-secret-change-me";
+// Fail closed: never run in production on the known default secret (anyone could
+// forge login tokens). Requires JWT_SECRET to be set in the environment.
+if (JWT_SECRET === "dev-insecure-secret-change-me") {
+  console.error("FATAL: JWT_SECRET is not set — refusing to start on the insecure default.");
+  process.exit(1);
+}
 const MONGODB_URI = process.env.MONGODB_URI || "";
 
 let _mongoClient = null;
@@ -325,7 +341,9 @@ function bucketDaily(dates, days) {
 }
 
 // Public (no auth) so the app can gate/announce for every user, even signed-out.
-app.get("/app-config", async (req, res) => {
+// Generous per-IP limit (called on every app launch) to blunt spam/abuse.
+const configLimiter = rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, legacyHeaders: false });
+app.get("/app-config", configLimiter, async (req, res) => {
   const current = parseInt(String(req.query.versionCode || "0"), 10) || 0;
   const cfg = await getConfig();
   const minVersionCode = parseInt(String(cfg.minVersionCode ?? 0), 10) || 0;
@@ -676,8 +694,8 @@ const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "";
 // Server-side source of truth for prices (in paise). Never trust an amount sent
 // by the browser — the plan key is all the client gets to choose.
 const RZP_PLANS = {
-  adfree: { amount: 19900, plan: "adfree" }, // ₹199.00
-  pro:    { amount: 34900, plan: "pro" },    // ₹349.00
+  adfree: { amount: 29900, plan: "adfree" }, // ₹299.00
+  pro:    { amount: 54900, plan: "pro" },    // ₹549.00
 };
 
 // 1) Create an order for the chosen plan.
