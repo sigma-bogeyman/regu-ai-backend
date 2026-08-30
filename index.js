@@ -454,7 +454,9 @@ app.get("/admin/ga", requireAuth, async (req, res) => {
     res.json({ configured: true, activeNow, totals, daily, topPages, topCountries });
   } catch (e) {
     console.error("[/admin/ga]", e.message);
-    res.status(502).json({ configured: true, error: "Could not load Google Analytics data." });
+    // Return 200 with the real message so the admin panel can show what went wrong
+    // (admin-only view) instead of the panel silently disappearing.
+    res.json({ configured: true, error: String(e.message || e).slice(0, 400) });
   }
 });
 
