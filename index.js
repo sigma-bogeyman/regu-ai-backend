@@ -833,6 +833,44 @@ const FEEDS = [
     url: GN("CDSCO India drug pharmaceutical regulatory approval"),
     homeLink: "https://cdsco.gov.in",
   },
+
+  // ── Intelligence categories (Google News RSS — news-aggregated, tagged by `category`).
+  // Not official databases; they surface coverage of these events, clearly labelled.
+  {
+    agency: "FDA", category: "Warning Letter",
+    url: GN("FDA warning letter pharmaceutical cGMP data integrity"),
+    homeLink: "https://www.fda.gov/inspections-compliance-enforcement-and-criminal-investigations/compliance-actions-and-activities/warning-letters",
+  },
+  {
+    agency: "Regulatory", category: "Approval",
+    url: GN("FDA new drug approval OR \"CHMP positive opinion\" new medicine"),
+    homeLink: "https://www.fda.gov/drugs/development-approval-process-drugs",
+  },
+  {
+    agency: "Regulatory", category: "Recall",
+    url: GN("pharmaceutical drug recall FDA enforcement class"),
+    homeLink: "https://www.fda.gov/safety/recalls-market-withdrawals-safety-alerts",
+  },
+  {
+    agency: "Regulatory", category: "Guidance",
+    url: GN("FDA OR EMA OR ICH new draft guidance pharmaceutical published"),
+    homeLink: "https://www.fda.gov/regulatory-information/search-fda-guidance-documents",
+  },
+  {
+    agency: "Regulatory", category: "Safety Alert",
+    url: GN("FDA drug safety communication OR EMA PRAC safety signal"),
+    homeLink: "https://www.fda.gov/drugs/drug-safety-and-availability",
+  },
+  {
+    agency: "Industry", category: "M&A",
+    url: GN("pharmaceutical company acquisition OR merger deal biotech"),
+    homeLink: "https://www.fiercepharma.com",
+  },
+  {
+    agency: "FDA", category: "DMF",
+    url: GN("Drug Master File DMF FDA active pharmaceutical ingredient"),
+    homeLink: "https://www.fda.gov/drugs/drug-master-files-dmfs",
+  },
 ];
 
 // STATIC_ONLY_AGENCIES: these are guaranteed via static data (their names are too ambiguous
@@ -982,11 +1020,12 @@ function isRelevantArticle(title, link) {
 async function buildNewsFeed() {
   // Fetch all RSS feeds in parallel — failures are caught individually
   const results = await Promise.allSettled(
-    FEEDS.map(async ({ agency, url, homeLink }) => {
+    FEEDS.map(async ({ agency, url, homeLink, category }) => {
       const feed = await parser.parseURL(url);
       return (feed.items || [])
         .map((item) => ({
           agency,
+          category: category || "",
           title: item.title?.replace(/<[^>]*>/g, "").trim() || "No title",
           date: item.pubDate || item.isoDate || new Date().toISOString(),
           link: item.link || homeLink,
