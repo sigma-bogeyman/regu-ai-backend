@@ -449,6 +449,33 @@ app.get("/admin/stats", requireAuth, async (req, res) => {
 // Admin-only: Google Analytics 4 web-traffic summary (via the GA Data API).
 // Reuses the Play service account (needs Viewer access on the GA property +
 // the Analytics Data API enabled). Returns {configured:false} until GA_PROPERTY_ID is set.
+// ── DAILY BRIEF DIGEST ─────────────────────────────────────
+// A 2-3 sentence synthesised morning brief. Generated once per day from the
+// client-sent top headlines and cached in-memory (shared by all users → ~1
+// OpenAI call/day). Fails soft to "" so the brief just hides the box.
+let _digestCache = { date: "", text: "" };
+app.post("/daily-digest", requireAuth, async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  if (_digestCache.date === today && _digestCache.text) return res.json({ date: today, text: _digestCache.text });
+  if (!openai) return res.json({ date: today, text: "" });
+  try {
+    const titles = Array.isArray(req.body?.titles) ? req.body.titles.slice(0, 12).map((t) => String(t).slice(0, 200)) : [];
+    if (!titles.length) return res.json({ date: today, text: "" });
+    const prompt = `You are a regulatory-affairs analyst writing a short morning brief for pharmaceutical RA professionals. From these headlines, synthesise the 2-3 most important themes today in plain, factual language. No preamble, no bullet points, no headline-copying, under 60 words.\n\nHeadlines:\n${titles.map((t) => `- ${t}`).join("\n")}`;
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: 160,
+    });
+    const text = (completion.choices?.[0]?.message?.content || "").trim();
+    if (text) _digestCache = { date: today, text };
+    res.json({ date: today, text });
+  } catch (e) {
+    console.error("[/daily-digest]", e.message);
+    res.json({ date: today, text: "" });
+  }
+});
+
 app.get("/admin/ga", requireAuth, async (req, res) => {
   if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
   if (!GA_PROPERTY_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) return res.json({ configured: false });
