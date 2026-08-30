@@ -142,13 +142,18 @@ const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
 // Railway stores the PEM with literal \n — turn them back into real newlines.
 const GOOGLE_PRIVATE_KEY  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
-let _gTok = { token: null, exp: 0 };
-// Exchange the service-account key for a short-lived Google API access token.
-async function getGoogleAccessToken() {
-  if (_gTok.token && Date.now() < _gTok.exp - 60_000) return _gTok.token;
+// GA4 property (numeric, e.g. 15526298983) — set in Railway to enable the Web-traffic panel.
+const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID || "";
+
+// Mint a short-lived Google access token for the given scope, using the same
+// service account as Play billing. Cached per-scope so scopes don't clash.
+const _tokCache = {};
+async function getGoogleToken(scope) {
+  const c = _tokCache[scope];
+  if (c && Date.now() < c.exp - 60_000) return c.token;
   if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) throw new Error("Google service account not configured");
   const assertion = jwt.sign(
-    { scope: "https://www.googleapis.com/auth/androidpublisher" },
+    { scope },
     GOOGLE_PRIVATE_KEY,
     { algorithm: "RS256", issuer: GOOGLE_CLIENT_EMAIL, audience: "https://oauth2.googleapis.com/token", expiresIn: 3600 }
   );
@@ -159,8 +164,12 @@ async function getGoogleAccessToken() {
   });
   const data = await r.json();
   if (!data.access_token) throw new Error("Google token error: " + JSON.stringify(data));
-  _gTok = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
+  _tokCache[scope] = { token: data.access_token, exp: Date.now() + (data.expires_in || 3600) * 1000 };
   return data.access_token;
+}
+// Play billing uses the androidpublisher scope.
+async function getGoogleAccessToken() {
+  return getGoogleToken("https://www.googleapis.com/auth/androidpublisher");
 }
 
 // GET a subscription purchase's status from the Play Developer API.
@@ -393,6 +402,59 @@ app.get("/admin/stats", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("[/admin/stats]", e);
     res.status(500).json({ error: "Could not load stats." });
+  }
+});
+
+// Admin-only: Google Analytics 4 web-traffic summary (via the GA Data API).
+// Reuses the Play service account (needs Viewer access on the GA property +
+// the Analytics Data API enabled). Returns {configured:false} until GA_PROPERTY_ID is set.
+app.get("/admin/ga", requireAuth, async (req, res) => {
+  if (!isAdminReq(req)) return res.status(403).json({ error: "Admins only." });
+  if (!GA_PROPERTY_ID || !GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY) return res.json({ configured: false });
+  try {
+    const token = await getGoogleToken("https://www.googleapis.com/auth/analytics.readonly");
+    const base = `https://analyticsdata.googleapis.com/v1beta/properties/${GA_PROPERTY_ID}`;
+    const auth = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+    const batchBody = {
+      requests: [
+        { dateRanges: [{ startDate: "27daysAgo", endDate: "today" }], metrics: [{ name: "sessions" }, { name: "totalUsers" }, { name: "screenPageViews" }] },
+        { dateRanges: [{ startDate: "13daysAgo", endDate: "today" }], dimensions: [{ name: "date" }], metrics: [{ name: "sessions" }], orderBys: [{ dimension: { dimensionName: "date" } }] },
+        { dateRanges: [{ startDate: "27daysAgo", endDate: "today" }], dimensions: [{ name: "pagePath" }], metrics: [{ name: "screenPageViews" }], orderBys: [{ metric: { metricName: "screenPageViews" }, desc: true }], limit: 5 },
+        { dateRanges: [{ startDate: "27daysAgo", endDate: "today" }], dimensions: [{ name: "country" }], metrics: [{ name: "totalUsers" }], orderBys: [{ metric: { metricName: "totalUsers" }, desc: true }], limit: 5 },
+      ],
+    };
+    const [batchR, rtR] = await Promise.all([
+      fetch(`${base}:batchRunReports`, { method: "POST", headers: auth, body: JSON.stringify(batchBody) }),
+      fetch(`${base}:runRealtimeReport`, { method: "POST", headers: auth, body: JSON.stringify({ metrics: [{ name: "activeUsers" }] }) }),
+    ]);
+    const batch = await batchR.json();
+    const rt = await rtR.json();
+    if (batch.error) throw new Error(JSON.stringify(batch.error));
+
+    const reports = batch.reports || [];
+    const num = (x) => Math.round(parseFloat(x || "0")) || 0;
+    const totalsRow = (reports[0]?.rows || [])[0];
+    const totals = {
+      sessions: num(totalsRow?.metricValues?.[0]?.value),
+      users: num(totalsRow?.metricValues?.[1]?.value),
+      views: num(totalsRow?.metricValues?.[2]?.value),
+    };
+    const dailyMap = {};
+    for (const row of (reports[1]?.rows || [])) dailyMap[row.dimensionValues?.[0]?.value] = num(row.metricValues?.[0]?.value);
+    const daily = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400_000);
+      const key = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+      daily.push(dailyMap[key] || 0);
+    }
+    const topPages = (reports[2]?.rows || []).map((r) => ({ path: r.dimensionValues?.[0]?.value || "/", views: num(r.metricValues?.[0]?.value) }));
+    const topCountries = (reports[3]?.rows || []).map((r) => ({ country: r.dimensionValues?.[0]?.value || "—", users: num(r.metricValues?.[0]?.value) }));
+    const activeNow = num((rt.rows || [])[0]?.metricValues?.[0]?.value);
+
+    res.json({ configured: true, activeNow, totals, daily, topPages, topCountries });
+  } catch (e) {
+    console.error("[/admin/ga]", e.message);
+    res.status(502).json({ configured: true, error: "Could not load Google Analytics data." });
   }
 });
 
