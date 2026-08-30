@@ -139,8 +139,25 @@ function escapeHtml(s) {
 // ── GOOGLE PLAY BILLING verification (server-side) ─────────
 const ANDROID_PACKAGE     = process.env.ANDROID_PACKAGE_NAME || "com.regverse.app";
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || "";
-// Railway stores the PEM with literal \n — turn them back into real newlines.
-const GOOGLE_PRIVATE_KEY  = (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+// Robustly normalise the service-account private key however Railway stored it:
+// strip wrapping quotes, turn literal \n into real newlines, and if it's not a
+// PEM (no BEGIN header) try base64-decoding it. Fixes the "secretOrPrivateKey
+// must be an asymmetric key" error that breaks both Play verification and GA.
+function loadPrivateKey(raw) {
+  let k = String(raw || "").trim();
+  if (k.length >= 2 && ((k[0] === '"' && k[k.length - 1] === '"') || (k[0] === "'" && k[k.length - 1] === "'"))) {
+    k = k.slice(1, -1).trim();
+  }
+  if (k.includes("\\n")) k = k.replace(/\\n/g, "\n");
+  if (!k.includes("BEGIN")) {
+    try {
+      const dec = Buffer.from(k, "base64").toString("utf8");
+      if (dec.includes("BEGIN")) k = dec;
+    } catch {}
+  }
+  return k;
+}
+const GOOGLE_PRIVATE_KEY = loadPrivateKey(process.env.GOOGLE_PRIVATE_KEY);
 
 // GA4 property (numeric, e.g. 15526298983) — set in Railway to enable the Web-traffic panel.
 const GA_PROPERTY_ID = process.env.GA_PROPERTY_ID || "";
